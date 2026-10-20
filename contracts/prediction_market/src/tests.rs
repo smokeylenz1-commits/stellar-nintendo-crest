@@ -1034,3 +1034,115 @@ fn test_e2e_full_inter_contract_flow() {
     assert_eq!(t.xlm.balance(&charlie), charlie_before);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// 43. Council Dispute Voting, Timelock Delay, and Bettor A/B Test
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_bettor_a_yes_bettor_b_no_council_voting_and_timelock() {
+    let t = setup();
+
+    // Create Market: "Will BTC exceed $100k?"
+    let market_id = t.client.create_market(
+        &t.admin,
+        &String::from_str(&t.env, "Will BTC exceed $100k?"),
+        &String::from_str(&t.env, "https://btc.png"),
+        &Category::Crypto,
+        &3600_u64,
+    );
+
+    let bettor_a = Address::generate(&t.env);
+    let bettor_b = Address::generate(&t.env);
+    fund_user(&t, &bettor_a, 500_0000000);
+    fund_user(&t, &bettor_b, 500_0000000);
+
+    // Bettor A bets 100 XLM YES, Bettor B bets 100 XLM NO
+    t.client.place_bet(&bettor_a, &market_id, &true, &100_0000000_i128);
+    t.client.place_bet(&bettor_b, &market_id, &false, &100_0000000_i128);
+
+    let market = t.client.get_market(&market_id);
+    assert_eq!(market.total_yes, 98_0000000);
+    assert_eq!(market.total_no, 98_0000000);
+
+    // Setup 4 council members and a 3-of-4 threshold
+    let c1 = Address::generate(&t.env);
+    let c2 = Address::generate(&t.env);
+    let c3 = Address::generate(&t.env);
+    let c4 = Address::generate(&t.env);
+
+    t.client.add_council_member(&t.admin, &c1);
+    t.client.add_council_member(&t.admin, &c2);
+    t.client.add_council_member(&t.admin, &c3);
+    t.client.add_council_member(&t.admin, &c4);
+    t.client.set_council_threshold(&t.admin, &3_u32);
+
+    // Council votes NO
+    t.client.vote_council_dispute(&c1, &market_id, &false);
+    t.client.vote_council_dispute(&c2, &market_id, &false);
+    let state_before = t.client.get_dispute_vote_state(&market_id);
+    assert!(!state_before.threshold_reached);
+
+    // 3rd vote reaches threshold
+    t.client.vote_council_dispute(&c3, &market_id, &false);
+    let state_threshold = t.client.get_dispute_vote_state(&market_id);
+    assert!(state_threshold.threshold_reached);
+    assert_eq!(state_threshold.no_votes, 3);
+    assert!(!state_threshold.resolved_outcome);
+
+    // 4th vote also recorded
+    t.client.vote_council_dispute(&c4, &market_id, &false);
+    let state_4 = t.client.get_dispute_vote_state(&market_id);
+    assert_eq!(state_4.no_votes, 4);
+
+    // Attempting early finalization before timelock passes should fail
+    let early_res = t.client.try_finalize_council_dispute(&market_id);
+    assert_eq!(early_res, Err(Ok(MarketError::TimelockNotElapsed)));
+
+    // Advance time past 1 hour timelock (3600 seconds)
+    advance_time(&t.env, 3601);
+
+    // Finalize dispute
+    t.client.finalize_council_dispute(&market_id);
+    let finalized_market = t.client.get_market(&market_id);
+    assert!(finalized_market.resolved);
+    assert!(!finalized_market.outcome); // outcome is NO
+
+    // Bettor B claims winnings + IPREDICT reward tokens
+    let bettor_b_before = t.xlm.balance(&bettor_b);
+    t.client.claim(&bettor_b, &market_id);
+    let bettor_b_payout = t.xlm.balance(&bettor_b) - bettor_b_before;
+    assert_eq!(bettor_b_payout, 196_0000000); // 98 net + 98 net
+    assert_eq!(t.leaderboard_client.get_points(&bettor_b), 30);
+    assert_eq!(t.token_client.balance(&bettor_b), 10_0000000);
+
+    // Fee withdrawal to admin treasury
+    let treasury = Address::generate(&t.env);
+    let fees = t.client.get_accumulated_fees();
+    assert_eq!(fees, 4_0000000); // 2 XLM fee each
+    let withdrawn = t.client.withdraw_fees(&t.admin, &treasury);
+    assert_eq!(withdrawn, 4_0000000);
+}
+
+#[test]
+fn test_reject_market_resolution_with_zero_bets() {
+    let t = setup();
+    let id = create_test_market(&t);
+
+    // Advance past end time without any bets placed
+    advance_time(&t.env, 3601);
+
+    // Resolving market with zero bets should be rejected with ZeroWinningBets
+    let res = t.client.try_resolve_market(&t.admin, &id, &true);
+    assert_eq!(res, Err(Ok(MarketError::ZeroWinningBets)));
+
+    // Strict resolution with zero bets on winning side is also rejected
+    let charlie = Address::generate(&t.env);
+    fund_user(&t, &charlie, 200_0000000);
+    t.client.place_bet(&charlie, &id, &false, &100_0000000_i128);
+
+    // Resolving YES when only NO bets exist fails strict resolution
+    let res_strict = t.client.try_resolve_market_strict(&t.admin, &id, &true);
+    assert_eq!(res_strict, Err(Ok(MarketError::ZeroWinningBets)));
+}
+
+

@@ -53,6 +53,13 @@ pub enum MarketError {
     NotAuthorized      = 18,
     MarketNotCancelled = 19,
     RateLimitExceeded  = 20,
+    ZeroWinningBets    = 21,
+    TimelockNotElapsed = 22,
+    QuorumNotReached   = 23,
+    AlreadyVoted       = 24,
+    NotCouncilMember   = 25,
+    DisputeAlreadyFinalized = 26,
+    DisputeNotFound    = 27,
 }
 
 // ── Storage Keys ──────────────────────────────────────────────────────────────
@@ -72,6 +79,70 @@ pub enum DataKey {
     FeeRecipient(Address),
     HasReferrer(Address),
     RateWindow,            // packed u64: high32=window_start_hi, low32=count
+    CouncilVotingThreshold,
+    CouncilMember(Address),
+    DisputeVote(u64),
+    CouncilMemberVoted(u64, Address),
+}
+
+// ── Timelock Constants ────────────────────────────────────────────────────────
+const DISPUTE_TIMELOCK_SECONDS: u64 = 3600;
+
+// ── Events ────────────────────────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimEvent {
+    pub market_id: u64,
+    pub user: Address,
+    pub payout: i128,
+    pub points: u64,
+    pub tokens: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeWithdrawalEvent {
+    pub caller: Address,
+    pub recipient: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeVoteEvent {
+    pub market_id: u64,
+    pub voter: Address,
+    pub vote_yes: bool,
+    pub current_yes_votes: u32,
+    pub current_no_votes: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeThresholdReachedEvent {
+    pub market_id: u64,
+    pub outcome: bool,
+    pub timelock_until: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeFinalizedEvent {
+    pub market_id: u64,
+    pub outcome: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeVoteState {
+    pub yes_votes: u32,
+    pub no_votes: u32,
+    pub threshold: u32,
+    pub threshold_reached: bool,
+    pub threshold_reached_at: u64,
+    pub resolved_outcome: bool,
+    pub finalized: bool,
 }
 
 // ── Config packed into one instance storage slot ───────────────────────────
@@ -409,14 +480,45 @@ impl PredictionMarketContract {
         if env.ledger().timestamp() < market.end_time { return Err(MarketError::MarketNotExpired); }
 
         let winning_side = if outcome { market.total_yes } else { market.total_no };
+        let total_pool = market.total_yes + market.total_no;
+        if total_pool == 0 {
+            return Err(MarketError::ZeroWinningBets);
+        }
+
         if winning_side == 0 {
-            let total_pool = market.total_yes + market.total_no;
             if total_pool > 0 {
                 let mut acc: i128 = env.storage().instance()
                     .get(&DataKey::AccumulatedFees).unwrap_or(0);
                 acc += total_pool;
                 env.storage().instance().set(&DataKey::AccumulatedFees, &acc);
             }
+        }
+
+        market.resolved = true;
+        market.outcome = outcome;
+        let mkt_key = DataKey::Market(market_id);
+        env.storage().persistent().set(&mkt_key, &market);
+        env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+        Ok(())
+    }
+
+    pub fn resolve_market_strict(
+        env: Env,
+        caller: Address,
+        market_id: u64,
+        outcome: bool,
+    ) -> Result<(), MarketError> {
+        caller.require_auth();
+        Self::require_admin_or_resolver(&env, &caller)?;
+
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.resolved  { return Err(MarketError::MarketResolved); }
+        if market.cancelled { return Err(MarketError::MarketCancelled); }
+        if env.ledger().timestamp() < market.end_time { return Err(MarketError::MarketNotExpired); }
+
+        let winning_side = if outcome { market.total_yes } else { market.total_no };
+        if winning_side == 0 {
+            return Err(MarketError::ZeroWinningBets);
         }
 
         market.resolved = true;
@@ -505,15 +607,13 @@ impl PredictionMarketContract {
         let this = env.current_contract_address();
 
         // XLM payout: only when the winning side had bettors.
-        // If winning_side == 0, the pool was swept to AccumulatedFees at resolve
-        // time so the admin/fee-recipient can withdraw it via withdraw_fees().
+        let mut payout: i128 = 0;
         if is_winner && winning_side > 0 {
-            let payout = (entry.net * total_pool) / winning_side;
+            payout = (entry.net * total_pool) / winning_side;
             token::Client::new(&env, &cfg.xlm_sac).transfer(&this, &user, &payout);
         }
 
         // All participants earn IPRED tokens + leaderboard points regardless.
-        // When winning_side == 0, "winners" receive loser-tier rewards (no competition).
         let real_win = is_winner && winning_side > 0;
         let (points, tokens): (u64, i128) = if real_win {
             (WIN_POINTS, WIN_TOKENS)
@@ -533,6 +633,17 @@ impl PredictionMarketContract {
             ],
         );
 
+        env.events().publish(
+            (Symbol::new(&env, "claim"), market_id),
+            ClaimEvent {
+                market_id,
+                user: user.clone(),
+                payout,
+                points,
+                tokens,
+            },
+        );
+
         Ok(())
     }
 
@@ -550,7 +661,175 @@ impl PredictionMarketContract {
             .transfer(&env.current_contract_address(), &recipient, &fees);
 
         env.storage().instance().set(&DataKey::AccumulatedFees, &0_i128);
+
+        env.events().publish(
+            (Symbol::new(&env, "fee_withdrawn"), caller.clone()),
+            FeeWithdrawalEvent {
+                caller: caller.clone(),
+                recipient: recipient.clone(),
+                amount: fees,
+            },
+        );
+
         Ok(fees)
+    }
+
+    // ── Council Dispute Voting and Timelock Mechanism ─────────────────────
+
+    pub fn add_council_member(env: Env, admin: Address, member: Address) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::CouncilMember(member), &true);
+        Ok(())
+    }
+
+    pub fn set_council_threshold(env: Env, admin: Address, threshold: u32) -> Result<(), MarketError> {
+        Self::require_admin(&env, &admin)?;
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::CouncilVotingThreshold, &threshold);
+        Ok(())
+    }
+
+    pub fn vote_council_dispute(
+        env: Env,
+        council_member: Address,
+        market_id: u64,
+        outcome: bool,
+    ) -> Result<(), MarketError> {
+        council_member.require_auth();
+        let is_council: bool = env.storage().instance().get(&DataKey::CouncilMember(council_member.clone())).unwrap_or(false);
+        if !is_council {
+            return Err(MarketError::NotCouncilMember);
+        }
+
+        let voted_key = DataKey::CouncilMemberVoted(market_id, council_member.clone());
+        let already_voted: bool = env.storage().persistent().get(&voted_key).unwrap_or(false);
+        if already_voted {
+            return Err(MarketError::AlreadyVoted);
+        }
+
+        let market = Self::load_market(&env, market_id)?;
+        if market.resolved {
+            return Err(MarketError::MarketResolved);
+        }
+        if market.cancelled {
+            return Err(MarketError::MarketCancelled);
+        }
+
+        let threshold: u32 = env.storage().instance().get(&DataKey::CouncilVotingThreshold).unwrap_or(3);
+        let vote_key = DataKey::DisputeVote(market_id);
+        let mut state: DisputeVoteState = env.storage().persistent().get(&vote_key).unwrap_or(DisputeVoteState {
+            yes_votes: 0,
+            no_votes: 0,
+            threshold,
+            threshold_reached: false,
+            threshold_reached_at: 0,
+            resolved_outcome: false,
+            finalized: false,
+        });
+
+        if state.finalized {
+            return Err(MarketError::DisputeAlreadyFinalized);
+        }
+
+        if outcome {
+            state.yes_votes += 1;
+        } else {
+            state.no_votes += 1;
+        }
+
+        env.storage().persistent().set(&voted_key, &true);
+        env.storage().persistent().extend_ttl(&voted_key, TTL_BUMP, TTL_HIGH);
+
+        env.events().publish(
+            (Symbol::new(&env, "council_vote"), market_id),
+            DisputeVoteEvent {
+                market_id,
+                voter: council_member,
+                vote_yes: outcome,
+                current_yes_votes: state.yes_votes,
+                current_no_votes: state.no_votes,
+            },
+        );
+
+        let relevant_votes = if outcome { state.yes_votes } else { state.no_votes };
+        if relevant_votes >= state.threshold && !state.threshold_reached {
+            state.threshold_reached = true;
+            state.threshold_reached_at = env.ledger().timestamp();
+            state.resolved_outcome = outcome;
+
+            env.events().publish(
+                (Symbol::new(&env, "threshold_reached"), market_id),
+                DisputeThresholdReachedEvent {
+                    market_id,
+                    outcome,
+                    timelock_until: state.threshold_reached_at + DISPUTE_TIMELOCK_SECONDS,
+                },
+            );
+        }
+
+        env.storage().persistent().set(&vote_key, &state);
+        env.storage().persistent().extend_ttl(&vote_key, TTL_BUMP, TTL_HIGH);
+
+        Ok(())
+    }
+
+    pub fn finalize_council_dispute(env: Env, market_id: u64) -> Result<(), MarketError> {
+        let vote_key = DataKey::DisputeVote(market_id);
+        let mut state: DisputeVoteState = env.storage().persistent().get(&vote_key)
+            .ok_or(MarketError::DisputeNotFound)?;
+
+        if !state.threshold_reached {
+            return Err(MarketError::QuorumNotReached);
+        }
+        if state.finalized {
+            return Err(MarketError::DisputeAlreadyFinalized);
+        }
+
+        let now = env.ledger().timestamp();
+        if now < state.threshold_reached_at + DISPUTE_TIMELOCK_SECONDS {
+            return Err(MarketError::TimelockNotElapsed);
+        }
+
+        let mut market = Self::load_market(&env, market_id)?;
+        if market.resolved {
+            return Err(MarketError::MarketResolved);
+        }
+
+        let winning_side = if state.resolved_outcome { market.total_yes } else { market.total_no };
+        let total_pool = market.total_yes + market.total_no;
+        if winning_side == 0 && total_pool > 0 {
+            let mut acc: i128 = env.storage().instance()
+                .get(&DataKey::AccumulatedFees).unwrap_or(0);
+            acc += total_pool;
+            env.storage().instance().set(&DataKey::AccumulatedFees, &acc);
+        }
+
+        market.resolved = true;
+        market.outcome = state.resolved_outcome;
+        state.finalized = true;
+
+        let mkt_key = DataKey::Market(market_id);
+        env.storage().persistent().set(&mkt_key, &market);
+        env.storage().persistent().extend_ttl(&mkt_key, TTL_BUMP, TTL_HIGH);
+
+        env.storage().persistent().set(&vote_key, &state);
+        env.storage().persistent().extend_ttl(&vote_key, TTL_BUMP, TTL_HIGH);
+
+        env.events().publish(
+            (Symbol::new(&env, "dispute_finalized"), market_id),
+            DisputeFinalizedEvent {
+                market_id,
+                outcome: state.resolved_outcome,
+            },
+        );
+
+        Ok(())
+    }
+
+    pub fn get_dispute_vote_state(env: Env, market_id: u64) -> Result<DisputeVoteState, MarketError> {
+        env.storage().persistent().get(&DataKey::DisputeVote(market_id))
+            .ok_or(MarketError::DisputeNotFound)
     }
 
     // ── View Functions ────────────────────────────────────────────────────
