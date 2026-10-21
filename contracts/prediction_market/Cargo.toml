@@ -19,3 +19,4 @@ soroban-sdk = { workspace = true, features = ["testutils"] }
 ipredict_token = { path = "../ipredict_token", features = ["testutils"] }
 leaderboard = { path = "../leaderboard", features = ["testutils"] }
 referral_registry = { path = "../referral_registry", features = ["testutils"] }
+proptest = "1"

@@ -50,3 +50,11 @@ yarn-error.log*
 
 # ── Stellar CLI local identity keystore ────────────────────────────────────────
 .stellar/
+
+# ── Database backups / PITR ────────────────────────────────────────────────────
+# Local artifacts produced by scripts/backup/* (base backups, WAL segments,
+# restore targets). Never commit database dumps or WAL archives.
+backups/
+wal-archive/
+*.dump
+*.sql.gz

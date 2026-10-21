@@ -225,4 +225,27 @@ describe("BettingPanel", () => {
     const input = screen.getByPlaceholderText("0.00") as HTMLInputElement;
     expect(input.value).toBe("5");
   });
+
+  it("renders slippage tolerance options (1%, 5%, 10%) and updates selection", () => {
+    render(<BettingPanel market={mockMarket} userBet={null} balance={100} />);
+    expect(screen.getByText("1%")).toBeInTheDocument();
+    expect(screen.getByText("5%")).toBeInTheDocument();
+    expect(screen.getByText("10%")).toBeInTheDocument();
+    fireEvent.click(screen.getByText("1%"));
+    expect(screen.getByText(/Min odds:/i)).toBeInTheDocument();
+  });
+
+  it("renders 'Finalize Outcome' action button when challenge window passes uncontested", () => {
+    const pastProposalMarket: Market = {
+      ...mockMarket,
+      endTime: Math.floor(Date.now() / 1000) - 90000,
+      proposedOutcome: true,
+      proposalTimestamp: Math.floor(Date.now() / 1000) - 86500,
+      challengeWindowSecs: 86400,
+      disputed: false,
+    };
+    render(<BettingPanel market={pastProposalMarket} userBet={null} balance={100} />);
+    expect(screen.getByText("Finalize Outcome")).toBeInTheDocument();
+  });
 });
+

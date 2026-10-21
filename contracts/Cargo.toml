@@ -28,3 +28,8 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+
+# Maximum allowed optimized WASM byte size per contract (64 KiB).
+# Enforced by the CI WASM build verification job (issue #103).
+[workspace.metadata.wasm-size-limit]
+max-bytes = 65536

@@ -7,6 +7,7 @@ import MarketImage from "./MarketImage";
 import OddsBar from "./OddsBar";
 import CountdownTimer from "./CountdownTimer";
 import Badge from "@/components/ui/Badge";
+import { oracleBadgeFor } from "@/lib/oracle-badge";
 
 interface MarketCardProps {
   market: Market;
@@ -55,6 +56,14 @@ export default function MarketCard({ market }: MarketCardProps) {
         />
         <div className="absolute top-3 left-3 flex items-center gap-1.5">
           <Badge variant={status.variant}>{status.label}</Badge>
+          {oracleBadgeFor(market.oracleState) && (
+            <span
+              title={oracleBadgeFor(market.oracleState)?.tooltip}
+              className={`px-2 py-0.5 rounded-full text-[10px] font-semibold ${oracleBadgeFor(market.oracleState)?.className}`}
+            >
+              {oracleBadgeFor(market.oracleState)?.label}
+            </span>
+          )}
           {endingSoon && (
             <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-orange-500/20 text-orange-400 text-[10px] font-semibold">
               <FiAlertTriangle className="w-2.5 h-2.5" />

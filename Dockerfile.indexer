@@ -1,0 +1,40 @@
+# syntax=docker/dockerfile:1.6
+
+# ---- Stage 1: build TypeScript binaries ----
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install build toolchain needed for native deps
+RUN apk add --no-cache python3 make g++
+
+# Install dependencies (including dev) using lockfile for reproducibility
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Copy sources and compile TypeScript
+COPY tsconfig*.json ./
+COPY src ./src
+RUN npm run build --if-present
+
+# Prune to production-only dependencies
+RUN npm prune --omit=dev
+
+# ---- Stage 2: minimal runtime ----
+FROM node:20-alpine AS runtime
+
+# Non-root runtime user
+RUN addgroup -S appuser && adduser -S -G appuser appuser
+
+WORKDIR /app
+ENV NODE_ENV=production
+
+# Copy only production node_modules and compiled JavaScript
+COPY --from=builder --chown=appuser:appuser /app/node_modules ./node_modules
+COPY --from=builder --chown=appuser:appuser /app/dist ./dist
+COPY --from=builder --chown=appuser:appuser /app/package.json ./package.json
+
+USER appuser
+
+# Indexer daemon entrypoint
+CMD ["node", "dist/indexer.js"]

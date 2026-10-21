@@ -253,6 +253,131 @@ fn test_burn_tokens() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
+//  10a. Burn reduces caller balance and total supply by the burned amount
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_burn_reduces_balance_and_supply() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &100_0000000_i128);
+    assert_eq!(client.balance(&user), 100_0000000_i128);
+    assert_eq!(client.total_supply(), 100_0000000_i128);
+
+    client.burn(&user, &40_0000000_i128);
+
+    assert_eq!(client.balance(&user), 60_0000000_i128);
+    assert_eq!(client.total_supply(), 60_0000000_i128);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  10b. Reject burn exceeding caller balance
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #4)")]
+fn test_reject_burn_insufficient_balance() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &10_0000000_i128);
+
+    // Attempt to burn more than balance
+    client.burn(&user, &20_0000000_i128); // panics
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  10c. Reject burn of zero amount
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_reject_burn_zero_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &10_0000000_i128);
+
+    client.burn(&user, &0_i128); // panics
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  10d. Reject burn of negative amount
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+#[should_panic(expected = "Error(Contract, #5)")]
+fn test_reject_burn_negative_amount() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &10_0000000_i128);
+
+    client.burn(&user, &-1_0000000_i128); // panics
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  10e. Burn emits ("token", "burned") event with correct from and amount
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn test_burn_emits_event() {
+    use soroban_sdk::{symbol_short, IntoVal, Symbol, Val, Vec};
+
+    let env = Env::default();
+    env.mock_all_auths();
+    let client = setup(&env);
+    let _admin = init(&env, &client);
+
+    let minter = Address::generate(&env);
+    client.set_minter(&minter);
+
+    let user = Address::generate(&env);
+    client.mint(&minter, &user, &50_0000000_i128);
+
+    client.burn(&user, &20_0000000_i128);
+
+    let events = env.events().all();
+    let expected_topics: Vec<Val> = (symbol_short!("token"), symbol_short!("burned")).into_val(&env);
+    let expected_data: Val = (user.clone(), 20_0000000_i128).into_val(&env);
+
+    let mut found = false;
+    for i in 0..events.len() {
+        let (_, topics, data) = events.get(i).unwrap();
+        if topics == expected_topics && data == expected_data {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "expected (\"token\", \"burned\") event was not emitted");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
 //  11. Total supply tracking across mint, transfer, and burn
 // ═══════════════════════════════════════════════════════════════════════════════
 

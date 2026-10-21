@@ -26,6 +26,8 @@ pub enum ReferralError {
 pub enum DataKey {
     Admin,
     MarketContract,
+    // Set once the welcome bonus has been paid (#16).
+    WelcomePaid(Address),
     // ── Legacy per-user keys (pre-Lever-A) — still READ for users who
     //    registered before the upgrade. New registrations no longer write these.
     Referrer(Address),
@@ -125,18 +127,7 @@ impl ReferralRegistryContract {
                 .set(&DataKey::ReferralCount(ref_addr.clone()), &(count + 1));
         }
 
-        let this = env.current_contract_address();
-        let leaderboard: Address = env.storage().instance().get(&DataKey::LeaderboardContract).unwrap();
-        let _: Val = env.invoke_contract(
-            &leaderboard,
-            &Symbol::new(&env, "reward_bonus"),
-            vec![&env,
-                this.into_val(&env),
-                user.into_val(&env),
-                WELCOME_BONUS_POINTS.into_val(&env),
-                WELCOME_BONUS_TOKENS.into_val(&env),
-            ],
-        );
+        // The welcome bonus is paid on the first bet, not here (#16).
         Ok(())
     }
 
@@ -148,6 +139,7 @@ impl ReferralRegistryContract {
     ) -> Result<bool, ReferralError> {
         caller.require_auth();
         Self::require_market_contract(&env, &caller)?;
+        Self::pay_welcome_once(&env, &user);
         // Lever A: resolve referrer via packed Profile (new) or legacy key (old).
         let referrer: Option<Address> = Self::load_profile(&env, &user).and_then(|p| p.referrer);
         match referrer {
@@ -181,6 +173,30 @@ impl ReferralRegistryContract {
     }
 
  
+    /// Pays the welcome bonus once, on the registered user's first bet (#16).
+    fn pay_welcome_once(env: &Env, user: &Address) {
+        if !Self::is_registered(env.clone(), user.clone()) {
+            return;
+        }
+        let key = DataKey::WelcomePaid(user.clone());
+        if env.storage().persistent().has(&key) {
+            return;
+        }
+        env.storage().persistent().set(&key, &true);
+        let this = env.current_contract_address();
+        let leaderboard: Address = env.storage().instance().get(&DataKey::LeaderboardContract).unwrap();
+        let _: Val = env.invoke_contract(
+            &leaderboard,
+            &Symbol::new(env, "reward_bonus"),
+            vec![env,
+                this.into_val(env),
+                user.into_val(env),
+                WELCOME_BONUS_POINTS.into_val(env),
+                WELCOME_BONUS_TOKENS.into_val(env),
+            ],
+        );
+    }
+
     fn load_profile(env: &Env, user: &Address) -> Option<UserProfile> {
         if let Some(p) = env.storage().persistent()
             .get::<DataKey, UserProfile>(&DataKey::Profile(user.clone())) {

@@ -1,0 +1,120 @@
+name: Deploy Staging (Stellar Testnet)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    name: Build and push images
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to container registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push staging image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ steps.meta.outputs.tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-staging:
+    name: Deploy to staging cluster
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ vars.STAGING_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Deploy updated containers to staging
+        env:
+          STAGING_DEPLOY_HOOK: ${{ secrets.STAGING_DEPLOY_HOOK }}
+          STAGING_KUBE_CONFIG: ${{ secrets.STAGING_KUBE_CONFIG }}
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:staging-${{ needs.build-and-push.outputs.image_tag }}
+        run: |
+          set -euo pipefail
+          if [ -n "${STAGING_KUBE_CONFIG:-}" ]; then
+            mkdir -p "$HOME/.kube"
+            printf '%s' "$STAGING_KUBE_CONFIG" > "$HOME/.kube/config"
+            kubectl -n staging set image deployment/staging "app=$IMAGE"
+            kubectl -n staging rollout status deployment/staging --timeout=5m
+          elif [ -n "${STAGING_DEPLOY_HOOK:-}" ]; then
+            curl -fsSL -X POST "$STAGING_DEPLOY_HOOK" -d "image=$IMAGE"
+          else
+            echo "::error::No staging deployment credentials configured (STAGING_KUBE_CONFIG or STAGING_DEPLOY_HOOK)."
+            exit 1
+          fi
+
+  smoke-test:
+    name: Testnet smoke tests
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Wait for staging to become healthy
+        env:
+          STAGING_URL: ${{ vars.STAGING_URL }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            if curl -fsS "$STAGING_URL/health" >/dev/null; then
+              echo "Staging is healthy."
+              exit 0
+            fi
+            echo "Waiting for staging... ($i/30)"
+            sleep 10
+          done
+          echo "::error::Staging did not become healthy in time."
+          exit 1
+
+      - name: Run testnet smoke test suite
+        env:
+          STELLAR_NETWORK: testnet
+          STAGING_URL: ${{ vars.STAGING_URL }}
+        run: |
+          set -euo pipefail
+          if [ -f scripts/smoke-test.sh ]; then
+            bash scripts/smoke-test.sh
+          else
+            echo "No scripts/smoke-test.sh found; running default health smoke check."
+            curl -fsS "$STAGING_URL/health"
+          fi
