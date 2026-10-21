@@ -1,0 +1,132 @@
+# Gitleaks configuration for the repository.
+# Enforces secret scanning on all pushes and pull requests.
+# Docs: https://github.com/gitleaks/gitleaks#configuration
+
+title = "Repository secret scanning"
+
+[extend]
+# Inherit the default gitleaks ruleset (AWS, GCP, generic API keys, etc.).
+useDefault = true
+
+# ---------------------------------------------------------------------------
+# Custom rules
+# ---------------------------------------------------------------------------
+
+[[rules]]
+id = "stellar-secret-key"
+description = "Stellar secret key (56-character S... seed)"
+regex = '''\bS[A-Z2-7]{55}\b'''
+entropy = 3.5
+keywords = [
+  "S",
+]
+
+[[rules]]
+id = "stellar-secret-key-assignment"
+description = "Stellar secret key assigned to a variable or config key"
+regex = '''(?i)(secret|seed|private[_-]?key|stellar[_-]?secret)[\w.-]*\s*[:=]\s*['"]?(S[A-Z2-7]{55})['"]?'''
+entropy = 3.5
+keywords = [
+  "secret",
+  "seed",
+  "private_key",
+  "private-key",
+  "stellar_secret",
+  "stellar-secret",
+]
+
+[[rules]]
+id = "database-password"
+description = "Database connection string containing an inline password"
+regex = '''(?i)(postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s:@/]+:[^\s:@/]+@'''
+keywords = [
+  "postgres://",
+  "postgresql://",
+  "mysql://",
+  "mongodb://",
+  "mongodb+srv://",
+  "redis://",
+  "amqp://",
+]
+
+[[rules]]
+id = "database-password-assignment"
+description = "Database password assigned to a variable or config key"
+regex = '''(?i)(db|database|postgres|mysql|mongo|redis)[\w.-]*(password|passwd|pwd)[\w.-]*\s*[:=]\s*['"]?[^\s'"]{6,}['"]?'''
+entropy = 3.0
+keywords = [
+  "db_password",
+  "db-password",
+  "database_password",
+  "database-password",
+  "postgres_password",
+  "postgres-password",
+  "mysql_password",
+  "mysql-password",
+  "mongo_password",
+  "mongo-password",
+  "redis_password",
+  "redis-password",
+]
+
+[[rules]]
+id = "generic-api-token"
+description = "Generic API token, secret, or access key assignment"
+regex = '''(?i)(api[_-]?key|api[_-]?secret|access[_-]?token|auth[_-]?token|secret[_-]?key|client[_-]?secret|bearer[_-]?token)\s*[:=]\s*['"]?[A-Za-z0-9_\-./+=]{16,}['"]?'''
+entropy = 3.5
+keywords = [
+  "api_key",
+  "api-key",
+  "api_secret",
+  "api-secret",
+  "access_token",
+  "access-token",
+  "auth_token",
+  "auth-token",
+  "secret_key",
+  "secret-key",
+  "client_secret",
+  "client-secret",
+  "bearer_token",
+  "bearer-token",
+]
+
+# ---------------------------------------------------------------------------
+# Allowlists
+# ---------------------------------------------------------------------------
+
+[allowlist]
+description = "Global allowlist for known non-secret placeholders and fixtures"
+paths = [
+  '''(^|/)node_modules/''',
+  '''(^|/)vendor/''',
+  '''(^|/)dist/''',
+  '''(^|/)build/''',
+  '''(^|/)target/''',
+  '''(^|/)\.git/''',
+  '''(^|/)package-lock\.json$''',
+  '''(^|/)yarn\.lock$''',
+  '''(^|/)pnpm-lock\.yaml$''',
+  '''(^|/)Cargo\.lock$''',
+  '''(^|/)go\.sum$''',
+  '''(^|/)\.gitleaks\.toml$''',
+  '''(^|/)\.github/workflows/security\.yml$''',
+  '''(?i).*\.(example|sample|template|md)$''',
+  '''(?i).*test.*''',
+  '''(?i).*fixture.*''',
+]
+regexes = [
+  '''(?i)(example|sample|placeholder|changeme|change[_-]?me|your[_-]?(key|token|secret|password)|xxx+|redacted|dummy|fake|test[_-]?(key|token|secret|password))''',
+  '''\$\{\{[^}]+\}\}''',
+  '''\$[A-Z_][A-Z0-9_]*''',
+  '''<[^>]+>''',
+]
+stopwords = [
+  "example",
+  "sample",
+  "placeholder",
+  "changeme",
+  "redacted",
+  "dummy",
+  "fake",
+]

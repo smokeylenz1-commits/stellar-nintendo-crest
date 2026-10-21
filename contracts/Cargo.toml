@@ -10,6 +10,11 @@ members = [
 [workspace.dependencies]
 soroban-sdk = "26.0.1"
 
+[workspace.metadata.audit]
+# cargo-audit configuration for the workspace.
+# Fail CI on any known vulnerability of moderate severity or higher.
+severity-threshold = "moderate"
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
@@ -23,3 +28,8 @@ lto = true
 [profile.release-with-logs]
 inherits = "release"
 debug-assertions = true
+
+# Maximum allowed optimized WASM byte size per contract (64 KiB).
+# Enforced by the CI WASM build verification job (issue #103).
+[workspace.metadata.wasm-size-limit]
+max-bytes = 65536

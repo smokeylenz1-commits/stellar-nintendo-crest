@@ -16,8 +16,10 @@ import {
 } from "@/config/network";
 import TxProgress from "@/components/ui/TxProgress";
 import ShareBetButton from "@/components/social/ShareBetButton";
+import { finalizeMarket } from "@/services/market";
 
 const QUICK_AMOUNTS = [1, 5, 10, 50, 100];
+const SLIPPAGE_OPTIONS = [1, 5, 10] as const;
 
 // Stellar accounts must keep a minimum balance locked (base reserve + per-entry
 // reserve) that can never be spent, plus a little headroom for the network fee
@@ -45,13 +47,15 @@ export default function BettingPanel({
   balance,
   onSuccess,
 }: BettingPanelProps) {
-  const { publicKey, connected } = useWallet();
+  const { publicKey, connected, signTransaction } = useWallet();
   const { submit, result, loading, stage, error, reset } = useBet();
   const { showToast } = useToast();
 
   const [side, setSide] = useState<boolean>(userBet?.isYes ?? true);
   const [amountStr, setAmountStr] = useState("");
+  const [slippagePct, setSlippagePct] = useState<number>(5);
   const [showShare, setShowShare] = useState(false);
+  const [finalizing, setFinalizing] = useState(false);
 
   // Lock side if user already has a bet
   useEffect(() => {
@@ -62,10 +66,22 @@ export default function BettingPanel({
   const feeAmount = (amount * TOTAL_FEE_BPS) / 10000;
   const netAmount = amount - feeAmount;
 
+  const nowSec = Math.floor(Date.now() / 1000);
   const isActive =
     !market.resolved &&
     !market.cancelled &&
-    market.endTime > Math.floor(Date.now() / 1000);
+    market.endTime > nowSec;
+
+  const challengeEnd =
+    market.proposalTimestamp !== undefined
+      ? market.proposalTimestamp + (market.challengeWindowSecs ?? 86400)
+      : undefined;
+  const canFinalizeUncontested =
+    !market.resolved &&
+    !market.cancelled &&
+    !market.disputed &&
+    challengeEnd !== undefined &&
+    nowSec >= challengeEnd;
 
   // Spendable = total balance minus the locked Stellar reserve + fee headroom.
   // Never let it go negative.
@@ -82,6 +98,9 @@ export default function BettingPanel({
     market.totalNo
   );
 
+  const currentSidePct = side ? yesPercent : noPercent;
+  const minAcceptableOdds = Math.max(0, Math.round((currentSidePct - slippagePct) * 100));
+
   const payout = useMemo(() => {
     const winningSide = side ? market.totalYes + netAmount : market.totalNo + netAmount;
     const totalPool = market.totalYes + market.totalNo + netAmount;
@@ -97,7 +116,23 @@ export default function BettingPanel({
   const handleSubmit = async () => {
     if (!canSubmit) return;
     reset();
-    await submit(market.id, side, amount);
+    await submit(market.id, side, amount, minAcceptableOdds);
+  };
+
+  const handleFinalizeOutcome = async () => {
+    if (!publicKey || !canFinalizeUncontested || finalizing) return;
+    setFinalizing(true);
+    try {
+      const res = await finalizeMarket(publicKey, market.id, signTransaction);
+      if (res.success) {
+        showToast("Market outcome finalized!", "success");
+        onSuccess?.();
+      } else {
+        showToast(res.error || "Failed to finalize outcome", "error");
+      }
+    } finally {
+      setFinalizing(false);
+    }
   };
 
   // Show share button after confirmed
@@ -214,6 +249,31 @@ export default function BettingPanel({
             {" "}· {spendable.toFixed(2)} bettable
           </span>
         </p>
+
+        {/* Slippage tolerance selector */}
+        <div className="space-y-1.5 pt-1">
+          <div className="flex items-center justify-between text-xs text-slate-500">
+            <span>Slippage tolerance</span>
+            <span>Min odds: {(minAcceptableOdds / 100).toFixed(0)}%</span>
+          </div>
+          <div className="flex items-center gap-2">
+            {SLIPPAGE_OPTIONS.map((pct) => (
+              <button
+                key={pct}
+                type="button"
+                onClick={() => setSlippagePct(pct)}
+                disabled={!isActive || loading}
+                className={`flex-1 py-1 rounded-lg text-xs font-medium border transition-colors disabled:opacity-50 ${
+                  slippagePct === pct
+                    ? "bg-primary-600/20 border-primary-600 text-primary-400"
+                    : "bg-surface-card border-surface-border text-slate-400 hover:text-white"
+                }`}
+              >
+                {pct}%
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {/* Payout calculator */}
@@ -324,6 +384,18 @@ export default function BettingPanel({
             Place Another Bet
           </button>
         </div>
+      )}
+
+      {/* Finalize Outcome button when challenge window passes uncontested */}
+      {canFinalizeUncontested && (
+        <button
+          type="button"
+          onClick={handleFinalizeOutcome}
+          disabled={!connected || finalizing}
+          className="w-full btn-secondary py-2.5 text-sm font-semibold border-accent-green/40 text-accent-green hover:bg-accent-green/10 disabled:opacity-50"
+        >
+          {finalizing ? "Finalizing..." : "Finalize Outcome"}
+        </button>
       )}
     </div>
   );

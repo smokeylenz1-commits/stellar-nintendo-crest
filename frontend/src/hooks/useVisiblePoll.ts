@@ -17,6 +17,10 @@ import { useEffect, useRef } from "react";
  * The callback should be "silent" (background refresh) — it must not flash a
  * loading skeleton, since the user already has data on screen.
  *
+ * NOTE: for live odds/pool data prefer `useMarketLiveUpdates` (SSE) so the UI
+ * updates the instant a bet lands on-chain instead of waiting for the next tick.
+ * Keep this hook for data that has no push channel.
+ *
  * @param callback  the refresh function to run on each tick (kept in a ref so a
  *                  changing identity does not reset the timer)
  * @param intervalMs poll cadence while visible

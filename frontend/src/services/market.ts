@@ -39,6 +39,11 @@ function addressVal(addr: string): xdr.ScVal {
   return new Address(addr).toScVal();
 }
 
+/** u32 — unsigned 32-bit integer */
+function u32Val(n: number): xdr.ScVal {
+  return nativeToScVal(n, { type: "u32" });
+}
+
 /** u64 — use BigInt to avoid JS number precision loss above 2^53 */
 function u64Val(n: number | bigint): xdr.ScVal {
   return nativeToScVal(BigInt(n), { type: "u64" });
@@ -355,18 +360,23 @@ export async function placeBet(
   marketId: number,
   isYes: boolean,
   amount: number,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  minAcceptableOdds?: number
 ): Promise<TransactionResult> {
+  const method = minAcceptableOdds !== undefined ? "place_bet_with_slippage" : "place_bet";
+  const args = [
+    addressVal(publicKey),
+    u64Val(marketId),
+    boolVal(isYes),
+    i128Val(xlmToStroops(amount)),
+    ...(minAcceptableOdds !== undefined ? [u32Val(minAcceptableOdds)] : []),
+  ];
+
   const result = await buildAndSendTx(
     publicKey,
     MARKET_CONTRACT_ID,
-    "place_bet",
-    [
-      addressVal(publicKey),
-      u64Val(marketId),
-      boolVal(isYes),
-      i128Val(xlmToStroops(amount)),
-    ],
+    method,
+    args,
     signTransaction
   );
 
@@ -377,6 +387,26 @@ export async function placeBet(
     cache.invalidate(CACHE_BETTORS(marketId));
     // Invalidate any XLM balance cache so BettingPanel shows updated balance
     cache.invalidate(`xlm_balance_${publicKey}`);
+  }
+  return result;
+}
+
+export async function finalizeMarket(
+  publicKey: string,
+  marketId: number,
+  signTransaction: (txXdr: string) => Promise<string>
+): Promise<TransactionResult> {
+  const result = await buildAndSendTx(
+    publicKey,
+    MARKET_CONTRACT_ID,
+    "finalize_market",
+    [addressVal(publicKey), u64Val(marketId)],
+    signTransaction
+  );
+
+  if (result.success) {
+    cache.invalidate(CACHE_MARKETS);
+    cache.invalidate(CACHE_MARKET(marketId));
   }
   return result;
 }

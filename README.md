@@ -37,6 +37,229 @@
 > **Native XLM SAC:** `CAS3J7GYLGXMF6TDJBBYYSE3HQ6BBSMLNUQ34T6TZMYMW2EVH34XOWMA` (mainnet)
 
 ---
+
+## TLS Certificate Monitoring & Renewal
+
+Production API and frontend endpoints use Let's Encrypt TLS certificates that must be renewed periodically. Expired certificates cause browser warnings and full platform downtime, so renewal and expiry monitoring are automated.
+
+### Automated Renewal (certbot)
+
+Certbot runs on a systemd timer and renews certificates before they expire. A deploy hook reloads the web server only when a certificate is actually renewed.
+
+```ini
+# /etc/systemd/system/certbot-renew.timer
+[Unit]
+Description=Run certbot twice daily
+
+[Timer]
+OnCalendar=*-*-* 00,12:00:00
+RandomizedDelaySec=3600
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+```ini
+# /etc/systemd/system/certbot-renew.service
+[Unit]
+Description=Certbot renewal
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/certbot renew --quiet --deploy-hook /usr/local/bin/reload-tls.sh
+```
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/reload-tls.sh — reload web server after a successful renewal
+set -euo pipefail
+systemctl reload nginx
+```
+
+Enable the timer once on each host:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now certbot-renew.timer
+```
+
+### Expiry Monitoring & Alerts
+
+A cron job checks every certificate daily and alerts operations when a certificate has **fewer than 15 days** remaining, or when the automated renewal itself fails. The check exits non-zero on any alert so the failure is also visible to the scheduler.
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/check-tls-expiry.sh
+# Alerts operations when a TLS certificate has < 15 days remaining.
+set -euo pipefail
+
+THRESHOLD_DAYS=15
+ALERT_WEBHOOK="${ALERT_WEBHOOK:?ALERT_WEBHOOK must be set}"
+HOSTS=("api.ipredict-stellar.app:443" "ipredict-stellar.vercel.app:443")
+
+fail=0
+for host in "${HOSTS[@]}"; do
+  end_date=$(echo | openssl s_client -servername "${host%%:*}" -connect "$host" 2>/dev/null \
+    | openssl x509 -noout -enddate | cut -d= -f2)
+  if [ -z "$end_date" ]; then
+    msg="TLS check failed: could not read certificate for $host"
+    curl -fsS -X POST -H 'Content-Type: application/json' \
+      -d "{\"text\":\"$msg\"}" "$ALERT_WEBHOOK" || true
+    fail=1
+    continue
+  fi
+  end_epoch=$(date -d "$end_date" +%s)
+  now_epoch=$(date +%s)
+  days_left=$(( (end_epoch - now_epoch) / 86400 ))
+  if [ "$days_left" -lt "$THRESHOLD_DAYS" ]; then
+    msg="TLS certificate for $host expires in ${days_left} days (< ${THRESHOLD_DAYS})"
+    curl -fsS -X POST -H 'Content-Type: application/json' \
+      -d "{\"text\":\"$msg\"}" "$ALERT_WEBHOOK" || true
+    fail=1
+  fi
+done
+exit "$fail"
+```
+
+```cron
+# /etc/cron.d/tls-expiry — daily certificate expiry check
+0 6 * * * root ALERT_WEBHOOK=https://hooks.example.com/ops /usr/local/bin/check-tls-expiry.sh
+```
+
+### Alerting on Renewal Failure
+
+The renewal service is paired with an `OnFailure` unit so operations are paged if certbot cannot renew a certificate:
+
+```ini
+# /etc/systemd/system/certbot-renew.service.d/alert.conf
+[Unit]
+OnFailure=certbot-renew-alert.service
+```
+
+```ini
+# /etc/systemd/system/certbot-renew-alert.service
+[Unit]
+Description=Alert operations that certbot renewal failed
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/curl -fsS -X POST -H 'Content-Type: application/json' \
+  -d '{"text":"certbot renewal FAILED — TLS certificates may expire"}' \
+  https://hooks.example.com/ops
+```
+
+---
+
+## Database Backup & Point-in-Time Recovery (PITR)
+
+Off-chain indexer records and oracle dispute history live in PostgreSQL. To survive corruption or accidental deletion, the database is backed up daily and continuously archived so it can be restored to any point in time.
+
+**Targets:** **RPO ≤ 5 minutes** (continuous WAL archiving) and **RTO ≤ 30 minutes** (restore base backup + replay WAL).
+
+### Daily Base Backup + WAL Archiving
+
+`pg_basebackup` takes a daily physical base backup, and PostgreSQL continuously archives WAL segments to an encrypted S3 bucket. Enable WAL archiving in `postgresql.conf`:
+
+```conf
+# postgresql.conf — continuous WAL archiving for PITR
+wal_level = replica
+archive_mode = on
+archive_command = 'aws s3 cp %p s3://ipredict-db-backups/wal/%f --sse AES256 --only-show-errors'
+archive_timeout = 300   # force a WAL switch at least every 5 minutes (RPO)
+```
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/pg-base-backup.sh — daily encrypted base backup to S3
+set -euo pipefail
+
+: "${PGHOST:=localhost}"
+: "${PGPORT:=5432}"
+: "${PGUSER:=postgres}"
+: "${BACKUP_BUCKET:=s3://ipredict-db-backups}"
+
+STAMP=$(date -u +%Y%m%dT%H%M%SZ)
+DEST="/var/backups/postgres/base-${STAMP}"
+mkdir -p "$DEST"
+
+# Physical base backup including the WAL needed to make it consistent.
+pg_basebackup \
+  --host "$PGHOST" --port "$PGPORT" --username "$PGUSER" \
+  --pgdata "$DEST" --wal-method=stream --checkpoint=fast --progress
+
+# Encrypt at rest and upload to the remote bucket.
+tar -C "$DEST" -czf - . \
+  | openssl enc -aes-256-cbc -pbkdf2 -salt -pass env:BACKUP_ENCRYPTION_KEY \
+  | aws s3 cp - "${BACKUP_BUCKET}/base/base-${STAMP}.tar.gz.enc" --sse AES256 --only-show-errors
+
+# Retain 30 days of base backups locally and remotely.
+find /var/backups/postgres -maxdepth 1 -name 'base-*' -mtime +30 -exec rm -rf {} +
+aws s3 ls "${BACKUP_BUCKET}/base/" | awk '{print $4}' | sort | head -n -30 \
+  | while read -r old; do aws s3 rm "${BACKUP_BUCKET}/base/${old}" --only-show-errors; done
+
+rm -rf "$DEST"
+echo "base backup ${STAMP} archived to ${BACKUP_BUCKET}"
+```
+
+```cron
+# /etc/cron.d/pg-backup — daily base backup at 02:00 UTC
+0 2 * * * postgres BACKUP_ENCRYPTION_KEY_FILE=/etc/ipredict/backup.key /usr/local/bin/pg-base-backup.sh
+```
+
+### Recovery Test Script
+
+Run this on staging to prove a backup restores and replays to a chosen point in time. It restores the latest base backup, replays archived WAL up to `RECOVERY_TARGET_TIME`, and verifies the database accepts connections.
+
+```bash
+#!/usr/bin/env bash
+# /usr/local/bin/pg-restore-test.sh — validate backup restoration + PITR on staging
+set -euo pipefail
+
+: "${BACKUP_BUCKET:=s3://ipredict-db-backups}"
+: "${RECOVERY_TARGET_TIME:?set RECOVERY_TARGET_TIME (e.g. 2024-01-01 12:00:00+00)}"
+RESTORE_DIR=/var/restore/postgres
+PGDATA="$RESTORE_DIR/data"
+
+rm -rf "$RESTORE_DIR" && mkdir -p "$PGDATA"
+
+# 1. Fetch and decrypt the most recent base backup.
+LATEST=$(aws s3 ls "${BACKUP_BUCKET}/base/" | sort | tail -n1 | awk '{print $4}')
+aws s3 cp "${BACKUP_BUCKET}/base/${LATEST}" - --only-show-errors \
+  | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BACKUP_ENCRYPTION_KEY \
+  | tar -C "$PGDATA" -xzf -
+
+# 2. Configure PITR: restore WAL from S3 and stop at the target time.
+cat >> "$PGDATA/postgresql.auto.conf" <<EOF
+restore_command = 'aws s3 cp ${BACKUP_BUCKET}/wal/%f %p --only-show-errors'
+recovery_target_time = '${RECOVERY_TARGET_TIME}'
+recovery_target_action = 'promote'
+EOF
+touch "$PGDATA/recovery.signal"
+
+# 3. Start the restored instance and wait for recovery to complete.
+pg_ctl -D "$PGDATA" -o "-p 55432" -w start
+until pg_isready -p 55432; do sleep 2; done
+
+# 4. Verify the database is consistent and queryable.
+psql -p 55432 -c 'SELECT pg_is_in_recovery();' | grep -q ' f' \
+  && echo "PITR restore to ${RECOVERY_TARGET_TIME} verified" \
+  || { echo "recovery did not complete"; exit 1; }
+
+pg_ctl -D "$PGDATA" -w stop
+```
+
+### Recovery Runbook
+
+1. **Declare incident** and freeze writes to the primary database.
+2. **Identify target time** — the last known-good point before corruption (RPO ≤ 5 min).
+3. **Provision a fresh instance** and restore the latest base backup from `s3://ipredict-db-backups/base/`.
+4. **Replay WAL** by setting `restore_command` and `recovery_target_time` as in the test script, then promote.
+5. **Validate** with `pg_isready` and a row-count sanity check on indexer/dispute tables.
+6. **Repoint the application** to the recovered instance and resume writes.
+7. **Post-mortem** — record actual RPO/RTO and adjust backup frequency if needed.
+
+---
 ## User Validation
 
 > The table below records our **pre-launch testnet validation** — 30+ real users
@@ -66,353 +289,11 @@
 | 16 | `GCXEQC2DIPFWPVR4JMROCYSB6YMP6TW3Q2YEV3IXTCRE4ZGSURKVL5LT` | Referral registration | 5 |
 | 17 | `GBDFA2O72OOCUII5NWWKQ6G7V2EZ6D3GDWIYMCMQFVOAHFVAAM33ZOFZ` | Referral registration | 5 |
 | 18 | `GACER5XK5SMHR64FZOELYPPLJVRWFBDY5UWCBOEBSLNK266Q2L45YD2P` | Referral registration | 5 |
-| 19 | `GDKZYMCENO7VCOHIZRAV5OP26X5F6KV5ETT7L35WW6G7QWD4TVI72CXE` | Referral registration | 5 |
-| 20 | `GCLS42CXE5GJGVNPBTF7YIJLI2QGO7LLZK5QFAGO7KPXRNQOLIUBZHFP` | Referral registration | 5 |
-| 21 | `GAW5CACDFYE4T4U26IYYSEJTGXLU4HU5LREGTM4D5NLRPZSK5Y4YBVCE` | Referral registration | 5 |
-| 22 | `GAWDCG7UCCJH4AOZPD45R4VPZG3XH7NVPIMZGNXT2BDKHMPRK6WSZXVV` | Referral registration | 5 |
-| 23 | `GDQIMRXKQDDPXAAU6RQIXFG34GZPV2TEZWJTPE6IPSISG4P5GF5CZZ3B` | Referral registration | 5 |
-| 24 | `GAEAQCVLZML7E74YYSA4VMACJWFZKABU774BDZ2PIOZC7QVQ3R3LKLPO` | Referral registration | 5 |
-| 25 | `GAYU7KUVSIO2CQDMPN7GB62GTJTG73UYOBVO6RVV6WPOO45R2PTGABJI` | Referral registration | 5 |
-| 26 | `GDJWQ5PBXYYRVQRMLZVRSKRCSJJBZNK2V7S5UN323JCUDK3D54YBUTM2` | Referral registration | 5 |
-| 27 | `GCO7CTBLSFEGZKBYNWO34COSOON3FRAOM44HF23XLRV5QM72ZGV35ZL4` | Referral registration | 5 |
-| 28 | `GBE663I55YXLC7U26GZBDUBHYXOYQFUXSXALDM2BXQRFUOPMFASGDGWQ` | Referral registration | 5 |
-| 29 | `GBX3HFO3J6IPOXPH2BWPWKNSCFNMKGANMFJPBFC3JACIMBJM6UISGNZK` | Referral registration | 5 |
-| 30 | `GASJLRNNMPYN3AIA6MFB6ETRDI5H5C36QRRXLFK62XZUJWGVK4YWNF6R` | Referral registration | 5 |
-| 31 | `GBQI3WD2YKYUWB4MXOO3QP7DPENLV3WD32EHA43VV3US2DCBOWEPV7GW` | Referral registration | 5 |
-
-## Screenshot of Leaderboard with 30+ Pre-Launch Testnet Users
-![Leaderboard of 30+ Users](image_of_30+_testnet_user.png)
-
-*Pre-launch testnet wallets verifiable on [Stellar Expert Testnet Explorer](https://stellar.expert/explorer/testnet). Live mainnet contracts are linked in the Deployed Contracts section above.*
-
-### User Feedback
-- **Form Link that I shared with users:** [https://forms.gle/WrTyoCzQ6LJegL8a9](https://forms.gle/WrTyoCzQ6LJegL8a9)
-- **The Spreadsheet with feedback:** [https://docs.google.com/spreadsheets/d/1rGhq1rgeDPiF6hI4iDL2eFt0vUMBDA6LSm9zS2txpiA/edit?usp=sharing](https://docs.google.com/spreadsheets/d/1rGhq1rgeDPiF6hI4iDL2eFt0vUMBDA6LSm9zS2txpiA/edit?usp=sharing)
-
----
-
-## User Feedback Implementation: Added more filtering and default sorting options to the leaderboard on Active
-|*User Name*| *User Email* | *User Wallet Adddress* | *Commit ID*|
-|----------------------|-------------------------|-------------------------|----------------|
-| best_bettor | `tesinger96@gmail.com` | `GA7GFCGUDLWZ6DIDCNERHA5CI7MATE6NT3MKDVJKFYIM5Y543OTLO3UY` | `77c37784589046eeeb917a9015085dfa6fb26a52` |
-
-
-## Advance Feature Added: Fee Sponsorship, Gasless Transactions
-  > we added a Fee Sponsorship, Gasless Transactions feature to our MVP, allowing users to interact with the prediction market without needing to hold XLM for transaction fees. This significantly lowers the barrier to entry, enabling anyone to place bets and participate in the market seamlessly. The platform covers the transaction fees on behalf of the users, creating a more inclusive and user-friendly experience.
-
-
-## Features
-
-- **Binary Prediction Markets** — Bet YES or NO on any question with XLM
-- **Inclusive Reward System** — Both winners AND losers earn points + IPREDICT tokens
-- **Onchain Referral Program** — Share your link, earn 0.5% of every referred bet + bonus points
-- **Real-Time Leaderboard** — Rankings by points, volume, and win rate from onchain data
-- **Social Sharing** — One-tap sharing to X, Telegram, WhatsApp after every bet
-- **4 Independent Smart Contracts** — Single responsibility, independently testable
-- **Near-Zero Fees** — Only 2% total (1.5% platform + 0.5% referrer)
-- **5-Second Finality** — Instant settlement on Stellar/Soroban
-- **Mobile-First Design** — Fully responsive glassmorphic UI
-- **Non-Custodial** — Your keys, your funds. Smart contracts handle everything
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     Next.js 14 Frontend                        │
-│  (App Router • Tailwind CSS • Stellar Wallets Kit)             │
-└──────────────┬──────────────┬──────────────┬──────────────┬─────┘
-               │              │              │              │
-        Soroban RPC      Soroban RPC    Soroban RPC    Soroban RPC
-               │              │              │              │
-  ┌────────────▼──┐ ┌────────▼────┐ ┌───────▼──────┐ ┌────▼────────┐
-  │  Prediction   │ │  IPREDICT   │ │   Referral   │ │ Leaderboard │
-  │    Market     │ │    Token    │ │   Registry   │ │             │
-  │               │ │             │ │              │ │             │
-  │ create_market │ │ mint        │ │ register     │ │ add_pts     │
-  │ place_bet ────┼─┼─► mint ◄───┼─┤ credit ──────┼─┤ record_bet  │
-  │ resolve    ───┼─┼─► mint     │ │ get_referrer │ │ get_stats   │
-  │ claim      ───┼─┼─► mint     │ │ get_earnings │ │ get_top     │
-  │ cancel        │ │ transfer   │ │ is_registered│ │ get_rank    │
-  │ withdraw_fees │ │ balance    │ │              │ │             │
-  └───────────────┘ └────────────┘ └──────────────┘ └─────────────┘
-```
-
-### Inter-Contract Call Flow
-
-**Place Bet:** `PredictionMarket.place_bet()` → Transfers XLM via SAC → `ReferralRegistry.credit()` (splits fee: 0.5% to referrer, 1.5% to platform) → `Leaderboard.record_bet()` → `IPredictToken.mint()` (bet participation tokens)
-
-**Resolve Market:** `PredictionMarket.resolve_market()` → Stores outcome onchain
-
-**Claim Reward:** `PredictionMarket.claim()` → Calculates pro-rata payout → Transfers XLM to user → `Leaderboard.add_pts()` (win: 30 pts / lose: 10 pts) → `IPredictToken.mint()` (win: 10 IPRED / lose: 2 IPRED)
-
-**Referral Registration:** `ReferralRegistry.register_referral()` → `Leaderboard.add_bonus_pts()` (5 pts) → `IPredictToken.mint()` (1 IPRED welcome bonus)
-
----
-
-## Reward System
-
-| Outcome | XLM Payout | Points | IPREDICT Tokens |
-|---------|-----------|--------|-----------------|
-| **Win** | Pro-rata share of losing pool | +30 pts | +10 IPRED |
-| **Lose** | 0 XLM | +10 pts | +2 IPRED |
-| **Cancelled** | Full refund | +10 pts | +2 IPRED |
-| **Referral Registration** | — | +5 pts | +1 IPRED |
-| **Referred Bet** (referrer earns) | 0.5% of bet | +3 pts | — |
-
-### Payout Formula
-
-$$\text{Payout} = \frac{\text{UserBet}}{\text{WinningSidePool}} \times \text{TotalPool}$$
-
-### Fee Model
-
-| Component | Rate | Recipient |
-|-----------|------|-----------|
-| Platform fee | 1.5% | Admin (accumulated, withdrawable) |
-| Referral fee | 0.5% | Referrer's XLM wallet |
-| **Total** | **2.0%** | Deducted at bet time |
-
-*If bettor has no referrer, full 2% goes to platform.*
-
----
-
-## Tech Stack
-
-| Layer | Technology | Version |
-|-------|-----------|---------|
-| **Smart Contracts** | Rust + Soroban SDK | 1.85.0 / 20.3.1 |
-| **Frontend** | Next.js (App Router) | 14.2.35 |
-| **UI** | React + Tailwind CSS | 18.3.1 / 3.4.17 |
-| **Language** | TypeScript | 5.7.3 |
-| **Wallet** | Stellar Wallets Kit | Freighter, xBull, Albedo |
-| **Testing** | Vitest + Testing Library | 2.1.9 |
-| **Contract Testing** | `#[test]` + soroban-sdk testutils | — |
-| **CI/CD** | GitHub Actions | Node 18/20 + Rust |
-| **Deployment** | Vercel (frontend) + Stellar Mainnet | — |
-
----
-
-## Project Structure
-
-```
-ipredict-stellar/
-├── .github/workflows/ci.yml       # CI pipeline (2 jobs)
-├── contracts/
-│   ├── Cargo.toml                  # Workspace manifest
-│   ├── prediction_market/          # Core market logic (36 tests)
-│   ├── ipredict_token/             # Platform token (11 tests)
-│   ├── referral_registry/          # Referral tracking (13 tests)
-│   └── leaderboard/                # Rankings + stats (10 tests)
-├── frontend/
-│   ├── public/                     # Favicon, OG image
-│   ├── src/
-│   │   ├── app/                    # Next.js pages (7 routes)
-│   │   ├── components/             # 30+ React components
-│   │   │   ├── layout/             # Navbar, Footer, MobileMenu
-│   │   │   ├── market/             # MarketCard, BettingPanel, OddsBar…
-│   │   │   ├── leaderboard/        # LeaderboardTable, Tabs, PlayerRow
-│   │   │   ├── profile/            # BetHistory, PointsCard, Referral…
-│   │   │   ├── social/             # ShareBetButton, SocialShareModal
-│   │   │   ├── wallet/             # WalletConnect, WalletModal
-│   │   │   ├── admin/              # CreateMarket, Resolve, Stats
-│   │   │   └── ui/                 # Spinner, Skeleton, Toast, Badge…
-│   │   ├── hooks/                  # useMarket, useWallet, useBet…
-│   │   ├── services/               # Soroban RPC service layer
-│   │   ├── utils/                  # Helpers, cache, formatting
-│   │   ├── config/                 # Network constants
-│   │   └── types/                  # TypeScript interfaces
-│   ├── __tests__/                  # 9 test suites (137 tests)
-│   └── .env.local.example          # Environment template
-├── docs/
-│   ├── ARCHITECTURE.md
-│   ├── DEPLOYMENT-GUIDE.md
-│   ├── USER-FEEDBACK.md
-│   └── ITERATION-LOG.md
-└── README.md
-```
-
----
-
-## Getting Started
-
-### Prerequisites
-
-- **Rust** ≥ 1.85.0 with `wasm32-unknown-unknown` target
-- **Node.js** ≥ 18
-- **Stellar CLI** (`stellar-cli` or `soroban-cli`)
-- **Freighter Wallet** browser extension (for mainnet interaction)
-
-### Setup
-
-```bash
-# Clone
-git clone https://github.com/Akanimoh12/Stellar-iPredict.git
-cd Stellar-iPredict
-
-# Build smart contracts
-cd contracts
-stellar contract build
-cargo test   # 70 tests
-
-# Setup frontend
-cd ../frontend
-cp .env.local.example .env.local
-
-# Edit .env.local with your deployed contract IDs
-npm install
-npm test     # 137 tests
-npm run build
-npm run dev  # http://localhost:3000
-```
-
-### Deploy Contracts (Testnet for dev, Mainnet for production)
-
-See [docs/DEPLOYMENT-GUIDE.md](docs/DEPLOYMENT-GUIDE.md) for the full step-by-step deployment guide with correct dependency order.
-
----
-
-## Testing
-
-### Summary
-
-| Suite | Tests | Status |
-|-------|-------|--------|
-| **Prediction Market** (Rust) | 36 | ✅ All passing |
-| **Referral Registry** (Rust) | 13 | ✅ All passing |
-| **IPREDICT Token** (Rust) | 11 | ✅ All passing |
-| **Leaderboard** (Rust) | 10 | ✅ All passing |
-| **Frontend Helpers** | 49 | ✅ All passing |
-| **Frontend Cache** | 20 | ✅ All passing |
-| **BettingPanel Component** | 13 | ✅ All passing |
-| **MarketCard Component** | 10 | ✅ All passing |
-| **LeaderboardTable Component** | 10 | ✅ All passing |
-| **Navbar Component** | 7 | ✅ All passing |
-| **WalletConnect Component** | 6 | ✅ All passing |
-| **Market Service** | 12 | ✅ All passing |
-| **Leaderboard Service** | 10 | ✅ All passing |
-| **Total** | **207** | **✅ All passing** |
-
-### Run Tests
-
-```bash
-# Rust contract tests
-cd contracts && cargo test
-
-# Frontend tests
-cd frontend && npm test
-
-# Frontend tests with coverage
-cd frontend && npx vitest run --coverage
-```
-
----
-
-## CI/CD Pipeline
-
-GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push to `main`/`develop` and every PR to `main`.
-
-### Job 1: `lint-test-build`
-- **Matrix:** Node.js 18, 20
-- **Steps:** `npm ci` → `npm test` → `npm run build`
-- **Artifacts:** Production build uploaded on Node 20
-
-### Job 2: `contract-check`
-- **Toolchain:** Rust stable + `wasm32-unknown-unknown` target
-- **Steps:** `cargo check --workspace` → `cargo test --workspace`
-- **Cache:** Cargo registry + target directory cached
-
----
-
-### Feedback & Iteration
-
-See [docs/USER-FEEDBACK.md](docs/USER-FEEDBACK.md) for the full feedback log.
-
-**Iteration Summary:** After initial testnet deployment, user feedback on loading states led to replacing spinner-only loading indicators with content-aware skeleton placeholders across leaderboard, profile, and market detail pages — improving perceived performance and reducing layout shift.
-
----
-
-## Smart Contract Functions
-
-### Prediction Market
-
-| Function | Description |
-|----------|-------------|
-| `initialize(admin, token, referral, leaderboard, xlm_sac)` | One-time setup with linked contracts |
-| `create_market(admin, question, image_url, duration_secs)` | Create new prediction market |
-| `place_bet(user, market_id, is_yes, amount)` | Place or increase bet (2% fee deducted) |
-| `resolve_market(admin, market_id, outcome)` | Admin resolves with YES/NO outcome |
-| `cancel_market(admin, market_id)` | Cancel market, enable refunds |
-| `claim(user, market_id)` | Claim payout + points + tokens |
-| `withdraw_fees(admin)` | Admin withdraws accumulated platform fees |
-| `get_market(market_id)` | Read market data |
-| `get_bet(market_id, user)` | Read user's bet on market |
-| `get_market_count()` | Total markets created |
-| `get_odds(market_id)` | Current YES/NO percentages |
-| `get_market_bettors(market_id)` | List all bettors on a market |
-| `get_accumulated_fees()` | Total unclaimed platform fees |
-
-### IPREDICT Token
-
-| Function | Description |
-|----------|-------------|
-| `initialize(admin, name, symbol, decimals)` | One-time token setup |
-| `set_minter(minter)` | Authorize address to mint (multi-minter) |
-| `remove_minter(minter)` | Revoke minting rights |
-| `mint(minter, to, amount)` | Mint tokens (authorized minters only) |
-| `transfer(from, to, amount)` | Transfer tokens between accounts |
-| `burn(from, amount)` | Burn tokens |
-| `balance(account)` | Get token balance |
-| `total_supply()` | Total tokens minted |
-| `name()` / `symbol()` / `decimals()` | Token metadata |
-
-### Referral Registry
-
-| Function | Description |
-|----------|-------------|
-| `initialize(admin, market, token, leaderboard, xlm_sac)` | One-time setup |
-| `register_referral(user, display_name, referrer?)` | Register with optional referrer |
-| `credit(caller, user, referral_fee)` | Credit referral fee (called by market contract) |
-| `get_referrer(user)` | Get user's referrer address |
-| `get_display_name(user)` | Get registered display name |
-| `get_referral_count(user)` | Number of referrals |
-| `get_earnings(user)` | Total referral earnings |
-| `has_referrer(user)` / `is_registered(user)` | Status checks |
-
-### Leaderboard
-
-| Function | Description |
-|----------|-------------|
-| `initialize(admin, market, referral)` | One-time setup |
-| `add_pts(caller, user, points, is_winner)` | Add win/loss points + update stats |
-| `add_bonus_pts(caller, user, points)` | Add bonus points (no stat inflation) |
-| `record_bet(caller, user)` | Increment total bets count |
-| `get_points(user)` | Get user's total points |
-| `get_stats(user)` | Full player stats (points, bets, wins, losses) |
-| `get_top_players(limit)` | Sorted leaderboard |
-| `get_rank(user)` | User's current rank |
-
----
-
-## Roadmap
-
-| Phase | Timeline | Milestone |
-|-------|----------|-----------|
-| **Foundation** | Feb 2026 | MVP launch, testnet, core markets |
-| **Growth** | Q2 2026 | User-created markets, oracle resolution, categories |
-| **Token Utility** | Q3 2026 | IPREDICT staking, governance, reward tiers |
-| **Scale** | Q4 2026 | Mainnet launch, mobile app, cross-chain bridges |
-
----
-
-## License
-
-[MIT](LICENSE)
-
----
-
-## Author
-
-Built by **Akan** for the Stellar Build-a-10M-Startup challenge.
+| 19 | `GDKZYMCENO7VCOHIZR
 
 - Stellar Admin Wallet: `GDHQ6TNWZ4V2JVCDWEUVW7YKFBXCOQZRRUCT27LAKES3PGOE6JSZMSMD`
+
+## Handsoff notes
+
+<!-- handsoff-issue-113 -->
+- #113: feat(monitoring): configure alert rules for stuck markets (>48h past expiry) and council inactivity

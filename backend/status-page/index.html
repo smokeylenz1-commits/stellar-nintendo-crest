@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Platform Status</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 2rem; background: #0f1115; color: #e6e8eb; }
+    header { max-width: 880px; margin: 0 auto 1.5rem; }
+    h1 { font-size: 1.5rem; margin: 0 0 .25rem; }
+    .overall { display: inline-block; padding: .25rem .6rem; border-radius: 999px; font-size: .85rem; font-weight: 600; }
+    .overall.ok { background: #10391f; color: #4ade80; }
+    .overall.degraded { background: #3a2c0a; color: #fbbf24; }
+    .overall.down { background: #3a1010; color: #f87171; }
+    main { max-width: 880px; margin: 0 auto; }
+    .component { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .9rem 1rem; border: 1px solid #23262d; border-radius: 10px; margin-bottom: .6rem; background: #16181d; }
+    .component .name { font-weight: 600; }
+    .component .metrics { font-size: .8rem; color: #9aa1ab; margin-top: .2rem; }
+    .badge { padding: .2rem .55rem; border-radius: 999px; font-size: .75rem; font-weight: 600; white-space: nowrap; }
+    .badge.operational { background: #10391f; color: #4ade80; }
+    .badge.degraded { background: #3a2c0a; color: #fbbf24; }
+    .badge.outage { background: #3a1010; color: #f87171; }
+    .badge.unknown { background: #23262d; color: #9aa1ab; }
+    section { margin-top: 2rem; }
+    h2 { font-size: 1.1rem; }
+    .incident { border-left: 3px solid #23262d; padding: .5rem 0 .5rem .9rem; margin-bottom: 1rem; }
+    .incident .meta { font-size: .8rem; color: #9aa1ab; }
+    .incident .title { font-weight: 600; margin: .15rem 0; }
+    .incident .body { font-size: .9rem; color: #c7ccd3; }
+    footer { max-width: 880px; margin: 2rem auto 0; font-size: .8rem; color: #6b7280; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Platform Status</h1>
+    <div id="overall" class="overall unknown">Checking status…</div>
+    <div class="meta" id="updated" style="font-size:.8rem;color:#9aa1ab;margin-top:.4rem"></div>
+  </header>
+
+  <main>
+    <div id="components"></div>
+
+    <section>
+      <h2>Incident History</h2>
+      <div id="incidents"></div>
+    </section>
+  </main>
+
+  <footer>
+    Status is derived from automated health probes. Last refresh: <span id="refresh">—</span>.
+  </footer>
+
+  <script>
+    // Component definitions map to automated health probes exposed by the backend.
+    // Each probe returns { status, latencyMs, detail } and is polled on an interval.
+    const COMPONENTS = [
+      { id: 'stellar-rpc', name: 'Stellar Horizon / RPC Node', probe: '/health/stellar-rpc' },
+      { id: 'indexer', name: 'Chain Indexer & Event Processing', probe: '/health/indexer' },
+      { id: 'oracle', name: 'Optimistic Oracle Resolvers', probe: '/health/oracle' },
+      { id: 'api', name: 'Backend REST API', probe: '/health/api' }
+    ];
+
+    const REFRESH_MS = 30000;
+
+    function statusClass(status) {
+      if (status === 'operational') return 'operational';
+      if (status === 'degraded') return 'degraded';
+      if (status === 'outage') return 'outage';
+      return 'unknown';
+    }
+
+    function renderComponents(results) {
+      const container = document.getElementById('components');
+      container.innerHTML = '';
+      results.forEach((r) => {
+        const el = document.createElement('div');
+        el.className = 'component';
+        const metrics = [];
+        if (typeof r.latencyMs === 'number') metrics.push('latency ' + r.latencyMs + ' ms');
+        if (typeof r.lagBlocks === 'number') metrics.push('indexer lag ' + r.lagBlocks + ' blocks');
+        if (r.detail) metrics.push(r.detail);
+        el.innerHTML =
+          '<div><div class="name"></div><div class="metrics"></div></div>' +
+          '<span class="badge ' + statusClass(r.status) + '"></span>';
+        el.querySelector('.name').textContent = r.name;
+        el.querySelector('.metrics').textContent = metrics.join(' · ') || 'no metrics';
+        el.querySelector('.badge').textContent = r.status || 'unknown';
+        container.appendChild(el);
+      });
+    }
+
+    function renderOverall(results) {
+      const el = document.getElementById('overall');
+      const hasOutage = results.some((r) => r.status === 'outage');
+      const hasDegraded = results.some((r) => r.status === 'degraded');
+      const allUnknown = results.every((r) => !r.status || r.status === 'unknown');
+      let label = 'All Systems Operational';
+      let cls = 'ok';
+      if (allUnknown) { label = 'Status Unavailable'; cls = 'degraded'; }
+      else if (hasOutage) { label = 'Major Outage'; cls = 'down'; }
+      else if (hasDegraded) { label = 'Partial Degradation'; cls = 'degraded'; }
+      el.className = 'overall ' + cls;
+      el.textContent = label;
+    }
+
+    async function fetchComponent(component) {
+      try {
+        const res = await fetch(component.probe, { cache: 'no-store' });
+        const data = await res.json();
+        return Object.assign({ id: component.id, name: component.name }, data);
+      } catch (err) {
+        return { id: component.id, name: component.name, status: 'unknown', detail: 'probe unreachable' };
+      }
+    }
+
+    async function refresh() {
+      const results = await Promise.all(COMPONENTS.map(fetchComponent));
+      renderComponents(results);
+      renderOverall(results);
+      const now = new Date().toLocaleString();
+      document.getElementById('updated').textContent = 'Last updated ' + now;
+      document.getElementById('refresh').textContent = now;
+    }
+
+    // Historical incident post-mortem log. Entries are static records of past incidents.
+    const INCIDENTS = [
+      {
+        date: '2024-11-02',
+        title: 'RPC node latency spike',
+        body: 'Horizon RPC latency exceeded 2s for ~18 minutes due to upstream provider throttling. Traffic was failed over to the secondary node; no data loss.'
+      },
+      {
+        date: '2024-09-14',
+        title: 'Indexer lag during ledger surge',
+        body: 'Event processing fell behind by ~400 blocks during a network surge. Backfill completed within 25 minutes; API served cached reads meanwhile.'
+      }
+    ];
+
+    function renderIncidents() {
+      const container = document.getElementById('incidents');
+      container.innerHTML = '';
+      INCIDENTS.forEach((inc) => {
+        const el = document.createElement('div');
+        el.className = 'incident';
+        el.innerHTML =
+          '<div class="meta"></div><div class="title"></div><div class="body"></div>';
+        el.querySelector('.meta').textContent = inc.date;
+        el.querySelector('.title').textContent = inc.title;
+        el.querySelector('.body').textContent = inc.body;
+        container.appendChild(el);
+      });
+    }
+
+    renderIncidents();
+    refresh();
+    setInterval(refresh, REFRESH_MS);
+  </script>
+</body>
+</html>

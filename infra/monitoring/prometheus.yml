@@ -1,0 +1,55 @@
+# Prometheus configuration for centralized metrics ingestion.
+# Scrapes backend, indexer, and oracle daemon services on a 15s interval
+# and forwards firing alerts to Alertmanager.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    cluster: production
+    monitor: prometheus
+
+# Route all firing alerts through Alertmanager, which fans them out to the
+# configured Slack / Discord / PagerDuty notification targets.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# Alerting and recording rules are loaded from this directory.
+rule_files:
+  - /etc/prometheus/rules/*.yml
+
+scrape_configs:
+  - job_name: prometheus
+    scrape_interval: 15s
+    static_configs:
+      - targets:
+          - localhost:9090
+
+  - job_name: backend
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - backend:3000
+        labels:
+          service: backend
+
+  - job_name: indexer
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - indexer:3001
+        labels:
+          service: indexer
+
+  - job_name: oracle-daemon
+    scrape_interval: 15s
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - oracle-daemon:3002
+        labels:
+          service: oracle-daemon

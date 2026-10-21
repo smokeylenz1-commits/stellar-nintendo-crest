@@ -5,6 +5,12 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main]
+  schedule:
+    # Daily TLS certificate expiry check (06:00 UTC)
+    - cron: '0 6 * * *'
+    # Daily PostgreSQL base backup + WAL archive (02:00 UTC)
+    - cron: '0 2 * * *'
+  workflow_dispatch:
 
 jobs:
   # ── Job 1: Frontend lint, test, and build ──────────────────────────────────
@@ -30,6 +36,14 @@ jobs:
         working-directory: frontend
         run: npm ci
 
+      - name: Audit dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
+      - name: Run lint
+        working-directory: frontend
+        run: npm run lint
+
       - name: Run tests
         working-directory: frontend
         run: npm test
@@ -46,7 +60,7 @@ jobs:
           path: frontend/.next
           retention-days: 7
 
-  # ── Job 2: Rust contract check & test ──────────────────────────────────────
+  # ── Job 2: Rust contract check, lint, format & test ────────────────────────
   contract-check:
     name: Contracts (Rust)
     runs-on: ubuntu-latest
@@ -59,6 +73,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown, wasm32v1-none
+          components: clippy, rustfmt
 
       - name: Cache Cargo registry & build
         uses: actions/cache@v4
@@ -70,6 +85,21 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('contracts/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit Rust dependencies
+        working-directory: contracts
+        run: cargo audit
+
+      - name: Check formatting
+        working-directory: contracts
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        working-directory: contracts
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Check workspace compiles
         working-directory: contracts
         run: cargo check --workspace
@@ -77,3 +107,101 @@ jobs:
       - name: Run contract tests
         working-directory: contracts
         run: cargo test --workspace
+
+  # ── Job 3: Node packages (backend, indexer, oracle) ────────────────────────
+  node-packages:
+    name: ${{ matrix.package }} (Node ${{ matrix.node-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [backend, indexer, oracle]
+        node-version: [18, 20]
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ipredict_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/ipredict_test
+      REDIS_URL: redis://localhost:6379
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ matrix.package }}/package-lock.json
+
+      - name: Install dependencies
+        working-directory: ${{ matrix.package }}
+        run: npm ci
+
+      - name: Audit dependencies
+        working-directory: ${{ matrix.package }}
+        run: npm audit --audit-level=high
+
+      - name: Typecheck
+        working-directory: ${{ matrix.package }}
+        run: npm run typecheck
+
+      - name: Run DB migrations
+        if: matrix.package == 'backend' || matrix.package == 'indexer'
+        working-directory: db
+        run: npm run migrate
+
+      - name: Run tests
+        working-directory: ${{ matrix.package }}
+        run: npm test
+
+  # ── Job 4: Database migration linting ──────────────────────────────────────
+  db-migrations:
+    name: DB (migration lint)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: db/package-lock.json
+
+      - name: Install dependencies
+        working-directory: db
+        run: npm ci
+
+      - name: Audit dependencies
+        working-directory: db
+        run: npm audit --audit-level=high
+
+      - name: Lint migrations
+        working-directory: db
+        run: npm run lint:migrations

@@ -1,0 +1,28 @@
+groups:
+  - name: indexer.rules
+    rules:
+      - alert: IndexerStalled
+        expr: indexer_lag_ledgers > 100
+        for: 3m
+        labels:
+          severity: critical
+          component: indexer
+        annotations:
+          summary: "Indexer is stalled (lag {{ $value }} ledgers > 100)"
+          description: "The indexer has been more than 100 ledgers behind the Stellar network head for over 3 minutes. Users will see delayed bets and stale market prices."
+          dashboard: "https://grafana.example.com/d/indexer-overview"
+          runbook: "https://github.com/example/repo/blob/main/docs/runbooks/indexer-stall.md"
+
+  - name: rpc.rules
+    rules:
+      - alert: RPCHighErrorRate
+        expr: rate(rpc_errors_total[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: high
+          component: rpc
+        annotations:
+          summary: "RPC node error rate is elevated ({{ $value | humanizePercentage }} errors/sec)"
+          description: "The RPC node is returning an elevated error rate over the last 5 minutes, which may cause failed transactions and stale data."
+          dashboard: "https://grafana.example.com/d/rpc-overview"
+          runbook: "https://github.com/example/repo/blob/main/docs/runbooks/rpc-failures.md"

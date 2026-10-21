@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1
+
+# ---------- Stage 1: build ----------
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies (including dev) for the build
+COPY package.json package-lock.json* ./
+RUN npm ci
+
+# Copy sources and compile TypeScript
+COPY tsconfig*.json ./
+COPY src ./src
+RUN npm run build
+
+# Prune to production-only dependencies
+RUN npm prune --omit=dev
+
+# ---------- Stage 2: runtime ----------
+FROM node:20-alpine AS runtime
+
+ENV NODE_ENV=production
+WORKDIR /app
+
+# Create non-root runtime user
+RUN addgroup -S appuser && adduser -S -G appuser appuser
+
+# Copy only production node_modules and compiled JavaScript
+COPY --from=builder --chown=appuser:appuser /app/node_modules ./node_modules
+COPY --from=builder --chown=appuser:appuser /app/dist ./dist
+COPY --from=builder --chown=appuser:appuser /app/package.json ./package.json
+
+USER appuser
+
+EXPOSE 3000
+
+CMD ["node", "dist/api/index.js"]

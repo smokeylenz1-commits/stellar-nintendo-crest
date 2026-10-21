@@ -1,0 +1,78 @@
+# Blackbox exporter synthetic probe configuration for issue #117.
+#
+# Verifies end-to-end frontend availability and Soroban RPC health from
+# external vantage points, independent of internal container health.
+#
+# Usage:
+#   blackbox_exporter --config.file=monitoring/blackbox/blackbox.yml
+#
+# Prometheus scrape example (30s interval, HTTP 200 assertion):
+#   - job_name: 'frontend-synthetic'
+#     metrics_path: /probe
+#     params:
+#       module: [http_2xx_frontend]
+#     static_configs:
+#       - targets:
+#           - https://app.example.org/health
+#     relabel_configs:
+#       - source_labels: [__address__]
+#         target_label: __param_target
+#       - source_labels: [__param_target]
+#         target_label: instance
+#       - target_label: __address__
+#         replacement: blackbox-exporter:9115
+#     scrape_interval: 30s
+#
+# Alert (fires when frontend response time exceeds 2.5s):
+#   - alert: FrontendResponseTimeHigh
+#     expr: probe_duration_seconds{job="frontend-synthetic"} > 2.5
+#     for: 1m
+#     labels:
+#       severity: critical
+#     annotations:
+#       summary: "Frontend response time exceeds 2.5s"
+#       description: "{{ $labels.instance }} responded in {{ $value }}s (>2.5s)."
+#
+#   - alert: FrontendProbeFailed
+#     expr: probe_success{job="frontend-synthetic"} == 0
+#     for: 1m
+#     labels:
+#       severity: critical
+#     annotations:
+#       summary: "Frontend /health probe failed"
+#       description: "{{ $labels.instance }} did not return HTTP 200."
+
+modules:
+  # Frontend uptime: assert HTTP 200 on /health every 30 seconds.
+  http_2xx_frontend:
+    prober: http
+    timeout: 5s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      method: GET
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: true
+      fail_if_ssl: false
+      fail_if_not_ssl: true
+
+  # Soroban RPC health: measure response latency from external vantage points.
+  http_2xx_soroban_rpc:
+    prober: http
+    timeout: 5s
+    http:
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      method: POST
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: true
+      fail_if_ssl: false
+      fail_if_not_ssl: true
+      body: '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+      headers:
+        Content-Type: application/json
+
+  # Generic TCP reachability for DNS/CDN edge checks.
+  tcp_connect:
+    prober: tcp
+    timeout: 5s

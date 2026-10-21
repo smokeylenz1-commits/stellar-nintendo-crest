@@ -13,16 +13,27 @@ export type TxStage =
   | "confirmed"
   | "failed";
 
+export interface OptimisticBet {
+  id: string;
+  marketId: number;
+  isYes: boolean;
+  amount: number;
+  status: "pending" | "confirmed" | "failed";
+  createdAt: number;
+}
+
 interface UseBetResult {
   submit: (
     marketId: number,
     isYes: boolean,
-    amount: number
+    amount: number,
+    minAcceptableOdds?: number
   ) => Promise<void>;
   result: TransactionResult | null;
   loading: boolean;
   stage: TxStage;
   error: string | null;
+  optimisticBet: OptimisticBet | null;
   reset: () => void;
 }
 
@@ -32,9 +43,17 @@ export function useBet(): UseBetResult {
   const [loading, setLoading] = useState(false);
   const [stage, setStage] = useState<TxStage>("idle");
   const [error, setError] = useState<string | null>(null);
+  const [optimisticBet, setOptimisticBet] = useState<OptimisticBet | null>(
+    null
+  );
 
   const submit = useCallback(
-    async (marketId: number, isYes: boolean, amount: number) => {
+    async (
+      marketId: number,
+      isYes: boolean,
+      amount: number,
+      minAcceptableOdds?: number
+    ) => {
       if (!publicKey) {
         setError("Wallet not connected");
         return;
@@ -45,6 +64,19 @@ export function useBet(): UseBetResult {
       setResult(null);
       setStage("building");
 
+      // Optimistically render the bet as soon as the user signs, so the
+      // betting history and odds preview update instantly instead of waiting
+      // for ledger consensus.
+      const optimisticId = `optimistic-${marketId}-${Date.now()}`;
+      setOptimisticBet({
+        id: optimisticId,
+        marketId,
+        isYes,
+        amount,
+        status: "pending",
+        createdAt: Date.now(),
+      });
+
       try {
         setStage("signing");
 
@@ -53,7 +85,8 @@ export function useBet(): UseBetResult {
           marketId,
           isYes,
           amount,
-          signTransaction
+          signTransaction,
+          minAcceptableOdds
         );
 
         setStage("submitting");
@@ -61,10 +94,20 @@ export function useBet(): UseBetResult {
         if (txResult.success) {
           setStage("confirmed");
           setResult(txResult);
+          // Reconcile the optimistic entry once the on-chain event confirms.
+          setOptimisticBet((prev) =>
+            prev && prev.id === optimisticId
+              ? { ...prev, status: "confirmed" }
+              : prev
+          );
         } else {
           setStage("failed");
           setError(txResult.error || "Transaction failed");
           setResult(txResult);
+          // Roll back the optimistic entry on failure.
+          setOptimisticBet((prev) =>
+            prev && prev.id === optimisticId ? null : prev
+          );
         }
       } catch (err) {
         setStage("failed");
@@ -81,6 +124,10 @@ export function useBet(): UseBetResult {
           message = String(err) || "Unknown error";
         }
         setError(message);
+        // Roll back the optimistic entry on error.
+        setOptimisticBet((prev) =>
+          prev && prev.id === optimisticId ? null : prev
+        );
       } finally {
         setLoading(false);
       }
@@ -92,9 +139,10 @@ export function useBet(): UseBetResult {
     setResult(null);
     setError(null);
     setStage("idle");
+    setOptimisticBet(null);
   }, []);
 
-  return { submit, result, loading, stage, error, reset };
+  return { submit, result, loading, stage, error, optimisticBet, reset };
 }
 
 function isAppError(err: unknown): err is AppError {
