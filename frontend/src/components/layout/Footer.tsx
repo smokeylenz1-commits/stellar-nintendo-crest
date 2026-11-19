@@ -2,6 +2,7 @@ import React from "react";
 import Link from "next/link";
 import Image from "next/image";
 import { FiTwitter, FiGithub, FiMessageCircle } from "react-icons/fi";
+import NetworkStatusIndicator from "./NetworkStatusIndicator";
 
 const PRODUCT_LINKS = [
   { href: "/markets", label: "Markets" },
@@ -120,6 +121,7 @@ export default function Footer() {
               className="rounded-lg"
             />
           </Link>
+          <NetworkStatusIndicator />
           <p className="text-sm text-slate-600">
             &copy; {new Date().getFullYear()} iPredict. Built on Stellar/Soroban.
           </p>

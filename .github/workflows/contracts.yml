@@ -1,0 +1,119 @@
+name: Soroban Contracts
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "contracts/**"
+      - ".github/workflows/contracts.yml"
+  workflow_dispatch:
+
+jobs:
+  build-lint-verify:
+    name: Build, lint & verify WASM
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Rust toolchain ──────────────────────────────────────────────────────
+      # rust-toolchain.toml in contracts/ pins the exact channel and targets
+      # required by Soroban SDK 26 (wasm32v1-none for contract builds).
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.91.0"
+          targets: wasm32-unknown-unknown, wasm32v1-none
+          components: clippy, rustfmt
+
+      # ── Cargo cache ─────────────────────────────────────────────────────────
+      - name: Cache Cargo registry & build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-contracts-${{ hashFiles('contracts/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-contracts-
+
+      # ── Stellar CLI (provides `stellar contract build`) ─────────────────────
+      - name: Install Stellar CLI
+        run: |
+          cargo install --locked stellar-cli --features opt \
+            --version 22.6.0 2>/dev/null || \
+          cargo install --locked stellar-cli --features opt \
+            --version 22.6.0
+
+      # ── Format check ────────────────────────────────────────────────────────
+      - name: Check formatting
+        working-directory: contracts
+        run: cargo fmt --all -- --check
+
+      # ── Clippy — zero warnings policy ──────────────────────────────────────
+      # -D warnings promotes every clippy warning to an error, failing CI if
+      # any lint fires.  This check runs against the host target so it has
+      # access to all code paths (std + no_std).
+      - name: Run clippy (zero-warnings policy)
+        working-directory: contracts
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # ── Build WASM binaries ──────────────────────────────────────────────────
+      # `stellar contract build` compiles each workspace member to
+      # target/wasm32v1-none/release/<name>.wasm using profile.release settings
+      # from Cargo.toml (opt-level=z, lto=true, strip=symbols).
+      - name: Build Soroban contracts
+        working-directory: contracts
+        run: stellar contract build
+
+      # ── WASM size gate ───────────────────────────────────────────────────────
+      # Soroban enforces a 64 KB limit on uploaded WASM binaries.
+      # This step hard-fails CI if any compiled artefact breaches that limit,
+      # giving developers an early signal before they attempt deployment.
+      - name: Verify WASM binary sizes (< 64 KB)
+        working-directory: contracts
+        run: |
+          WASM_SIZE_LIMIT=65536   # 64 KB in bytes
+          FAIL=0
+
+          echo "── WASM binary sizes ──────────────────────────────────────"
+          for wasm in target/wasm32v1-none/release/*.wasm; do
+            [ -f "$wasm" ] || continue
+            SIZE=$(stat -c%s "$wasm")
+            NAME=$(basename "$wasm")
+            HUMAN=$(numfmt --to=iec-i --suffix=B "$SIZE" 2>/dev/null || echo "${SIZE}B")
+            if [ "$SIZE" -gt "$WASM_SIZE_LIMIT" ]; then
+              echo "  FAIL  $NAME  ($HUMAN > 64 KiB)"
+              FAIL=1
+            else
+              echo "  OK    $NAME  ($HUMAN)"
+            fi
+          done
+          echo "────────────────────────────────────────────────────────────"
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo "One or more WASM binaries exceed the 64 KB Soroban limit."
+            exit 1
+          fi
+
+      # ── Upload compiled WASM artefacts ────────────────────────────────────
+      # Artefacts are attached to the workflow run so reviewers and downstream
+      # jobs can download the exact binaries that passed CI without rebuilding.
+      - name: Upload WASM artefacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: soroban-wasm-${{ github.sha }}
+          path: contracts/target/wasm32v1-none/release/*.wasm
+          if-no-files-found: error
+          retention-days: 30
+
+      # ── Run contract unit tests ───────────────────────────────────────────
+      - name: Run contract tests
+        working-directory: contracts
+        run: cargo test --workspace

@@ -1,0 +1,297 @@
+# ── iPredict — Local Developer Environment ────────────────────────────────────
+#
+# Usage:
+#   docker compose -f docker-compose.dev.yml up
+#
+# Services:
+#   postgres     — PostgreSQL 16 with auto-applied migrations
+#   redis        — Redis 7 for pub/sub and caching
+#   stellar      — Stellar Quickstart (standalone/local network + Soroban RPC)
+#   api          — Backend API with hot-reload (ts-node-dev / nodemon)
+#   indexer      — On-chain event indexer with hot-reload
+#   oracle       — Oracle daemon with hot-reload
+#   web          — Next.js frontend dev server with hot-reload
+#   seed         — One-shot container that funds testnet accounts and deploys
+#                  mock prediction market contracts
+#
+# Ports:
+#   3000  — Next.js frontend
+#   3001  — Backend API
+#   5432  — PostgreSQL
+#   6379  — Redis
+#   8000  — Stellar Horizon + Soroban RPC
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "3.9"
+
+x-node-common: &node-common
+  restart: unless-stopped
+  init: true  # forward signals correctly so hot-reload exits cleanly
+
+# ── Services ──────────────────────────────────────────────────────────────────
+
+services:
+  # --------------------------------------------------------------------------
+  # PostgreSQL 16
+  # --------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: ipredict-dev-postgres
+    <<: *node-common
+    environment:
+      POSTGRES_USER: ipredict
+      POSTGRES_PASSWORD: ipredict
+      POSTGRES_DB: ipredict_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-dev-data:/var/lib/postgresql/data
+      # Apply all migrations automatically on first startup.
+      - ./db/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipredict -d ipredict_dev"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # Redis 7
+  # --------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: ipredict-dev-redis
+    <<: *node-common
+    command: ["redis-server", "--appendonly", "yes", "--loglevel", "notice"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-dev-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --------------------------------------------------------------------------
+  # Stellar Quickstart — standalone local node + Soroban RPC
+  #
+  # --local     starts a standalone (non-testnet) network that produces ledgers
+  #             instantly on demand, giving deterministic 5-second closes.
+  # --enable-soroban-rpc  exposes the Soroban JSON-RPC at /soroban/rpc
+  # --------------------------------------------------------------------------
+  stellar:
+    image: stellar/quickstart:latest
+    container_name: ipredict-dev-stellar
+    <<: *node-common
+    platform: linux/amd64
+    command:
+      - --local
+      - --enable-soroban-rpc
+    ports:
+      - "8000:8000"
+    volumes:
+      - stellar-dev-data:/opt/stellar
+    environment:
+      # Increase the per-ledger entry and instruction limits for development
+      # so large test contracts don't hit resource limits.
+      SOROBAN_LEDGER_ENTRY_BYTES: "5242880"
+      SOROBAN_TX_MAX_INSTRUCTIONS: "100000000"
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - |
+          curl -sf http://localhost:8000/soroban/rpc \
+            -X POST \
+            -H 'Content-Type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}' \
+          | grep -q '"status":"healthy"' || exit 1
+      interval: 10s
+      timeout: 8s
+      start_period: 30s
+      retries: 20
+
+  # --------------------------------------------------------------------------
+  # Backend API — hot-reload via nodemon / ts-node-dev
+  # --------------------------------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      target: builder          # stop at the builder stage (dev deps included)
+    image: ipredict-dev-api
+    container_name: ipredict-dev-api
+    <<: *node-common
+    command: ["npm", "run", "dev"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://ipredict:ipredict@postgres:5432/ipredict_dev
+      REDIS_URL: redis://redis:6379
+      SOROBAN_RPC_URL: http://stellar:8000/soroban/rpc
+      HORIZON_URL: http://stellar:8000
+      NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+      CORS_ALLOWED_ORIGINS: "http://localhost:3000"
+      PORT: "3001"
+      LOG_LEVEL: debug
+    ports:
+      - "3001:3001"
+    volumes:
+      # Mount the full source tree so nodemon picks up changes immediately.
+      - ./backend:/app/backend
+      - ./backend/node_modules:/app/backend/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      stellar:
+        condition: service_healthy
+
+  # --------------------------------------------------------------------------
+  # Indexer — hot-reload
+  # --------------------------------------------------------------------------
+  indexer:
+    build:
+      context: .
+      dockerfile: Dockerfile.indexer
+      target: builder
+    image: ipredict-dev-indexer
+    container_name: ipredict-dev-indexer
+    <<: *node-common
+    command: ["npm", "run", "dev"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://ipredict:ipredict@postgres:5432/ipredict_dev
+      REDIS_URL: redis://redis:6379
+      SOROBAN_RPC_URL: http://stellar:8000/soroban/rpc
+      HORIZON_URL: http://stellar:8000
+      NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+      LOG_LEVEL: debug
+    volumes:
+      - ./indexer:/app/indexer
+      - ./indexer/node_modules:/app/indexer/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      stellar:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+
+  # --------------------------------------------------------------------------
+  # Oracle daemon — hot-reload
+  # --------------------------------------------------------------------------
+  oracle:
+    build:
+      context: .
+      dockerfile: Dockerfile.oracle
+      target: builder
+    image: ipredict-dev-oracle
+    container_name: ipredict-dev-oracle
+    <<: *node-common
+    command: ["npm", "run", "dev"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://ipredict:ipredict@postgres:5432/ipredict_dev
+      REDIS_URL: redis://redis:6379
+      SOROBAN_RPC_URL: http://stellar:8000/soroban/rpc
+      HORIZON_URL: http://stellar:8000
+      NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+      LOG_LEVEL: debug
+    volumes:
+      - ./backend/src/oracle:/app/backend/src/oracle
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stellar:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+
+  # --------------------------------------------------------------------------
+  # Next.js frontend — hot-reload
+  # --------------------------------------------------------------------------
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      target: deps           # install deps only; source is bind-mounted below
+    image: ipredict-dev-web
+    container_name: ipredict-dev-web
+    <<: *node-common
+    command: ["npm", "run", "dev"]
+    environment:
+      NODE_ENV: development
+      NEXT_PUBLIC_API_URL: http://localhost:3001
+      NEXT_PUBLIC_NETWORK: testnet
+      # Point browser-side Soroban calls at the local standalone node.
+      NEXT_PUBLIC_SOROBAN_RPC_URL: http://localhost:8000/soroban/rpc
+      NEXT_PUBLIC_HORIZON_URL: http://localhost:8000
+      NEXT_PUBLIC_NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+      NEXT_TELEMETRY_DISABLED: "1"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+      # Persist installed node_modules across source rebuilds.
+      - web-node-modules:/app/node_modules
+      # Persist .next build cache between restarts.
+      - web-next-cache:/app/.next
+    depends_on:
+      - api
+      - stellar
+
+  # --------------------------------------------------------------------------
+  # Seed — one-shot container
+  #
+  # Funds pre-seeded testnet accounts via Friendbot, deploys the prediction
+  # market contracts from the compiled WASM binaries, and creates a small set
+  # of mock markets so developers have data to work with immediately.
+  #
+  # The container exits with code 0 on success; Docker Compose marks it
+  # `service_completed_successfully` and downstream services proceed.
+  # --------------------------------------------------------------------------
+  seed:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+      target: builder
+    image: ipredict-dev-seed
+    container_name: ipredict-dev-seed
+    restart: "no"
+    command: ["node", "/app/scripts/dev-seed.js"]
+    environment:
+      NODE_ENV: development
+      DATABASE_URL: postgres://ipredict:ipredict@postgres:5432/ipredict_dev
+      SOROBAN_RPC_URL: http://stellar:8000/soroban/rpc
+      HORIZON_URL: http://stellar:8000
+      NETWORK_PASSPHRASE: "Standalone Network ; February 2017"
+      # Master key of the Quickstart root account (funded automatically).
+      # This is the well-known Quickstart dev key — safe for local use only.
+      SEED_ADMIN_SECRET: SCECNG5TSS4O5GNBOZ4JKBDCWHS2QXMRDTLBHIQQZFDPLGNACXLGC7L
+      SEED_ACCOUNTS_COUNT: "5"
+      SEED_MARKETS_COUNT: "10"
+    volumes:
+      - ./scripts:/app/scripts:ro
+      - ./contracts/target/wasm32v1-none/release:/app/wasm:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      stellar:
+        condition: service_healthy
+
+# ── Named volumes ─────────────────────────────────────────────────────────────
+
+volumes:
+  postgres-dev-data:
+    driver: local
+  redis-dev-data:
+    driver: local
+  stellar-dev-data:
+    driver: local
+  web-node-modules:
+    driver: local
+  web-next-cache:
+    driver: local
