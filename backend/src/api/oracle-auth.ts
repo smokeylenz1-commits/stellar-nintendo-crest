@@ -33,3 +33,17 @@ export function verifyBearerToken(authorizationHeader: string | undefined, expec
   const expected = Buffer.from(expectedHashHex, "hex");
   return presented.length === expected.length && timingSafeEqual(presented, expected);
 }
+
+/**
+ * Admin wallet signature verification for `/api/admin/*` (#244).
+ *
+ * Reuses the constant-time SHA-256 comparison used for oracle bearer tokens: the caller
+ * presents `X-Admin-Signature: <hex>` and we compare it against the expected hash of the
+ * admin wallet signature. The raw signature is never stored.
+ */
+export function verifyAdminSignature(signatureHeader: string | undefined, expectedHashHex: string): boolean {
+  if (!signatureHeader || signatureHeader.length === 0) return false;
+  const presented = Buffer.from(sha256Hex(signatureHeader), "hex");
+  const expected = Buffer.from(expectedHashHex, "hex");
+  return presented.length === expected.length && timingSafeEqual(presented, expected);
+}
