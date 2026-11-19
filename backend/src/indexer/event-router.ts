@@ -55,3 +55,18 @@ export function buildUserEventRouter(
   router.register("reward_points", handlers.rewardPoints);
   return router;
 }
+
+/**
+ * Builds the router with the market handlers wired in (#241): a new bet invalidates the cached
+ * market stats so the next odds query recomputes from the database and repopulates Redis.
+ */
+export function buildMarketEventRouter(
+  handlers: {
+    betPlaced: EventHandler;
+  },
+  onUnmapped: UnmappedHandler,
+): EventRouter {
+  const router = new EventRouter(onUnmapped);
+  router.register("bet_placed", handlers.betPlaced);
+  return router;
+}

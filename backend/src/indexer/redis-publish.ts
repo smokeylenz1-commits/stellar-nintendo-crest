@@ -26,6 +26,11 @@ export function channelFor(topic: string): string {
   return `stellar:events:${topic}`;
 }
 
+/** Redis hash key holding the cached stats for one market, `stellar:market:stats:<marketId>`. */
+export function marketStatsKey(marketId: number): string {
+  return `stellar:market:stats:${marketId}`;
+}
+
 /**
  * Publishes one committed event. Returns `true` when the message was sent, and `false` when the
  * publish failed. It never throws.
@@ -43,6 +48,35 @@ export async function publishCommittedEvent(
     logger.warn(
       { event: "redis_publish_failed", topic, error: err instanceof Error ? err.message : String(err) },
       "Could not publish indexed event; the database commit is unaffected",
+    );
+    return false;
+  }
+}
+
+/** Minimal Redis surface needed to invalidate a cached market stats hash. */
+export interface CacheClient {
+  del(...keys: string[]): Promise<number>;
+}
+
+/**
+ * Invalidates the cached market stats hash after a new bet has been committed (#241). The next
+ * market odds query will miss the cache, fall back to the database, and repopulate the hash.
+ *
+ * Like {@link publishCommittedEvent}, a Redis failure is logged and swallowed so it cannot block
+ * or roll back the indexing transaction.
+ */
+export async function invalidateMarketStats(
+  client: CacheClient,
+  logger: PublishLogger,
+  marketId: number,
+): Promise<boolean> {
+  try {
+    await client.del(marketStatsKey(marketId));
+    return true;
+  } catch (err) {
+    logger.warn(
+      { event: "redis_cache_invalidate_failed", marketId, error: err instanceof Error ? err.message : String(err) },
+      "Could not invalidate cached market stats; the database commit is unaffected",
     );
     return false;
   }
