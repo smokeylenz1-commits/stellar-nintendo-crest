@@ -38,6 +38,40 @@ export interface NotifierConfig {
   rateLimitWindowMs?: number;
 }
 
+/**
+ * Per-user communication preferences, keyed by Stellar wallet address.
+ * Mirrors the `user_notification_settings` table (one row per wallet).
+ */
+export interface UserNotificationSettings {
+  /** Stellar wallet address (primary key). */
+  walletAddress: string;
+  /** Notify when a bet is settled. */
+  betSettlement: boolean;
+  /** Notify when a dispute is raised or resolved. */
+  disputeAlerts: boolean;
+  /** Notify when a referral commission is credited. */
+  referralCommission: boolean;
+  /** Deliver alerts via email. */
+  emailEnabled: boolean;
+  /** Deliver alerts via push notification. */
+  pushEnabled: boolean;
+}
+
+/**
+ * A registered push notification token for a wallet address.
+ * Mirrors the `device_tokens` table (many tokens per wallet).
+ */
+export interface DeviceToken {
+  /** Stellar wallet address (foreign key to user_notification_settings). */
+  walletAddress: string;
+  /** Opaque push registration token issued by the platform. */
+  token: string;
+  /** Platform that issued the token. */
+  platform: 'ios' | 'android' | 'web';
+  /** ISO timestamp of registration. */
+  createdAt: string;
+}
+
 /** Severity color bars (decimal RGB) used for the embed side stripe. */
 const SEVERITY_COLORS: Record<AlertSeverity, number> = {
   critical: 0xd32f2f, // red

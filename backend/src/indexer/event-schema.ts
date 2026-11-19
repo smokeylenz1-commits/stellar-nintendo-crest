@@ -72,3 +72,43 @@ export function parseEventsOrDeadLetter(
   }
   return valid;
 }
+
+/**
+ * Notification storage schema (#253).
+ *
+ * These DDL statements create the tables that remember a user's communication preferences
+ * and their registered push device tokens. Both tables are keyed by the user's wallet
+ * address, which is indexed for instant lookup when an event trigger fires.
+ *
+ * `user_notification_settings` holds one row per wallet address with boolean toggles for
+ * bet settlement, dispute alerts, and referral commission notifications.
+ *
+ * `device_tokens` enforces a one-to-many relationship between a wallet address and its
+ * push tokens via a foreign key back to `user_notification_settings`.
+ */
+export const NOTIFICATION_SCHEMA_MIGRATION = `
+CREATE TABLE IF NOT EXISTS user_notification_settings (
+  wallet_address TEXT PRIMARY KEY,
+  bet_settlement_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  dispute_alerts_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  referral_commission_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_user_notification_settings_wallet
+  ON user_notification_settings (wallet_address);
+
+CREATE TABLE IF NOT EXISTS device_tokens (
+  id BIGSERIAL PRIMARY KEY,
+  wallet_address TEXT NOT NULL
+    REFERENCES user_notification_settings (wallet_address) ON DELETE CASCADE,
+  token TEXT NOT NULL,
+  platform TEXT NOT NULL DEFAULT 'unknown',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (wallet_address, token)
+);
+
+CREATE INDEX IF NOT EXISTS idx_device_tokens_wallet
+  ON device_tokens (wallet_address);
+`;

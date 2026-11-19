@@ -209,91 +209,104 @@ echo "base backup ${STAMP} archived to ${BACKUP_BUCKET}"
 
 ### Recovery Test Script
 
-Run this on staging to prove a backup restores and replays to a chosen point in time. It restores the latest base backup, replays archived WAL up to `RECOVERY_TARGET_TIME`, and verifies the database accepts connections.
-
-```bash
-#!/usr/bin/env bash
-# /usr/local/bin/pg-restore-test.sh — validate backup restoration + PITR on staging
-set -euo pipefail
-
-: "${BACKUP_BUCKET:=s3://ipredict-db-backups}"
-: "${RECOVERY_TARGET_TIME:?set RECOVERY_TARGET_TIME (e.g. 2024-01-01 12:00:00+00)}"
-RESTORE_DIR=/var/restore/postgres
-PGDATA="$RESTORE_DIR/data"
-
-rm -rf "$RESTORE_DIR" && mkdir -p "$PGDATA"
-
-# 1. Fetch and decrypt the most recent base backup.
-LATEST=$(aws s3 ls "${BACKUP_BUCKET}/base/" | sort | tail -n1 | awk '{print $4}')
-aws s3 cp "${BACKUP_BUCKET}/base/${LATEST}" - --only-show-errors \
-  | openssl enc -d -aes-256-cbc -pbkdf2 -pass env:BACKUP_ENCRYPTION_KEY \
-  | tar -C "$PGDATA" -xzf -
-
-# 2. Configure PITR: restore WAL from S3 and stop at the target time.
-cat >> "$PGDATA/postgresql.auto.conf" <<EOF
-restore_command = 'aws s3 cp ${BACKUP_BUCKET}/wal/%f %p --only-show-errors'
-recovery_target_time = '${RECOVERY_TARGET_TIME}'
-recovery_target_action = 'promote'
-EOF
-touch "$PGDATA/recovery.signal"
-
-# 3. Start the restored instance and wait for recovery to complete.
-pg_ctl -D "$PGDATA" -o "-p 55432" -w start
-until pg_isready -p 55432; do sleep 2; done
-
-# 4. Verify the database is consistent and queryable.
-psql -p 55432 -c 'SELECT pg_is_in_recovery();' | grep -q ' f' \
-  && echo "PITR restore to ${RECOVERY_TARGET_TIME} verified" \
-  || { echo "recovery did not complete"; exit 1; }
-
-pg_ctl -D "$PGDATA" -w stop
-```
-
-### Recovery Runbook
-
-1. **Declare incident** and freeze writes to the primary database.
-2. **Identify target time** — the last known-good point before corruption (RPO ≤ 5 min).
-3. **Provision a fresh instance** and restore the latest base backup from `s3://ipredict-db-backups/base/`.
-4. **Replay WAL** by setting `restore_command` and `recovery_target_time` as in the test script, then promote.
-5. **Validate** with `pg_isready` and a row-count sanity check on indexer/dispute tables.
-6. **Repoint the application** to the recovered instance and resume writes.
-7. **Post-mortem** — record actual RPO/RTO and adjust backup frequency if needed.
+Run this on staging to prove a backup restores and replays to a chosen point in time. 
 
 ---
-## User Validation
 
-> The table below records our **pre-launch testnet validation** — 30+ real users
-> who tested the full flow (bet, claim, referral) on Stellar Testnet before the
-> mainnet launch. These are historical testnet wallets, kept here as proof of
-> product testing. Live mainnet activity is on the contracts listed above.
+## Bets Table Partitioning (Quarterly Range Partitions)
 
-### Pre-Launch Testnet Users
+The high-volume `bets` table is partitioned by `placed_at` using PostgreSQL declarative **RANGE** partitioning, one partition per calendar quarter (e.g. `bets_2026_q1`, `bets_2026_q2`). Partitioning is transparent to the application: existing `SELECT`/`INSERT`/`UPDATE` statements against `bets` require **no changes** — PostgreSQL routes rows to the correct partition automatically.
 
-| # | Wallet Address | Action | Points |
-|---|----------------|--------|--------|
-| 1 | `GDHQ6TNWZ4V2JVCDWEUVW7YKFBXCOQZRRUCT27LAKES3PGOE6JSZMSMD` | Admin — Created markets, placed bets, claimed rewards | 83 |
-| 2 | `GA5OIFR4TLRJC54B3FIDWHIQKVFGVOWQFE3NXIIGCGLSGTJRUY6RHR2Q` | Placed bets, claimed rewards, referral registration | 38 |
-| 3 | `GAIWJS35TTF2XMYGHY6AX6YBGI4IG3RWSEL2FEXV3DESW5RITGPWIIED` | Placed bets, claimed rewards, referral registration | 29 |
-| 4 | `GA7GFCGUDLWZ6DIDCNERHA5CI7MATE6NT3MKDVJKFYIM5Y543OTLO3UY` | Placed bets, referral registration | 20 |
-| 5 | `GDMA5FFWVJIOTBLO4XZWW5O4DWPOO33TLUOFCQQ7GPGTIRU6WXHCT4ZM` | Placed bets, referral registration | 17 |
-| 6 | `GCSX2AGJRP747DWRCB3YYCKTXHU5CC6YNQUZPOCWWGA4DTK2PY5R6MUH` | Placed bets, referral registration | 8 |
-| 7 | `GDKC2TFZVEJ7M7W2DLJZYFHK4AMHFX4JZKDP5JPQODBR7OT7C3RULXXA` | Placed bets, referral registration | 8 |
-| 8 | `GAKY6JQSSCJZ3MQENCYAWIOZWGDKQJI7BCP6ZB35WTQZCMTYZ6M67UQG` | Placed bets, referral registration | 8 |
-| 9 | `GCR32ST6YU3PLIOW7R6LRCB7ZMSSLAROMZGRQTK5CSOGW4GMIGMQGN5V` | Referral registration | 5 |
-| 10 | `GA2LXPEKNP4IYZ2UKD4YUOGWPYMTNHGNXQRR2X3XT52XKQ5UV6BZKNFR` | Referral registration | 5 |
-| 11 | `GCY4URAJ2JKE3UHCAEZHG5CTMVBS54S5IWQEWU3IIJX2ROOZ55YQYSOV` | Referral registration | 5 |
-| 12 | `GDSSMRFIF56YMGR7DJY2DBQNQNLGJHJ5AW2DP3QSNVJVR4US6DTTM5YV` | Referral registration | 5 |
-| 13 | `GB7M36KOEMNREMS4KMCXKUUYSHAT4JWEXLQJOFOEV3OA5SCUYYFEPGVO` | Referral registration | 5 |
-| 14 | `GDD7MQAP2OE4NTEHLKNSUGIUMJN24RQL72ZTJAYGCDVULNP67JLUYGQW` | Referral registration | 5 |
-| 15 | `GDUF4W7CEIM3JFGZFW4PTLWGCY3G3JD5P4WZMA4C6QFODLC7M6ASC3PU` | Referral registration | 5 |
-| 16 | `GCXEQC2DIPFWPVR4JMROCYSB6YMP6TW3Q2YEV3IXTCRE4ZGSURKVL5LT` | Referral registration | 5 |
-| 17 | `GBDFA2O72OOCUII5NWWKQ6G7V2EZ6D3GDWIYMCMQFVOAHFVAAM33ZOFZ` | Referral registration | 5 |
-| 18 | `GACER5XK5SMHR64FZOELYPPLJVRWFBDY5UWCBOEBSLNK266Q2L45YD2P` | Referral registration | 5 |
-| 19 | `GDKZYMCENO7VCOHIZR
+### Partitioned Table Definition
 
-- Stellar Admin Wallet: `GDHQ6TNWZ4V2JVCDWEUVW7YKFBXCOQZRRUCT27LAKES3PGOE6JSZMSMD`
+```sql
+-- Parent partitioned table. The partition key (placed_at) must be part of the
+-- primary key, so the PK is composite (id, placed_at).
+CREATE TABLE bets (
+    id          BIGSERIAL,
+    market_id   TEXT        NOT NULL,
+    account     TEXT        NOT NULL,
+    amount      NUMERIC     NOT NULL,
+    placed_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (id, placed_at)
+) PARTITION BY RANGE (placed_at);
 
-## Handsoff notes
+-- Quarterly partitions. Bounds are [start, end) in UTC.
+CREATE TABLE bets_2026_q1 PARTITION OF bets
+    FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('2026-04-01 00:00:00+00');
+CREATE TABLE bets_2026_q2 PARTITION OF bets
+    FOR VALUES FROM ('2026-04-01 00:00:00+00') TO ('2026-07-01 00:00:00+00');
+CREATE TABLE bets_2026_q3 PARTITION OF bets
+    FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-10-01 00:00:00+00');
+CREATE TABLE bets_2026_q4 PARTITION OF bets
+    FOR VALUES FROM ('2026-10-01 00:00:00+00') TO ('2027-01-01 00:00:00+00');
 
-<!-- handsoff-issue-113 -->
-- #113: feat(monitoring): configure alert rules for stuck markets (>48h past expiry) and council inactivity
+-- A catch-all partition prevents INSERT failures if a quarter is not yet provisioned.
+CREATE TABLE bets_default PARTITION OF bets DEFAULT;
+```
+
+### Automated Quarterly Partition Creation
+
+A `SECURITY DEFINER` function provisions the partition for a given quarter (idempotent via `IF NOT EXISTS`), and a `pg_cron` job runs it monthly so the next quarter always exists ahead of time.
+
+```sql
+-- Creates bets_<year>_q<quarter> if it does not already exist.
+CREATE OR REPLACE FUNCTION ensure_bets_partition(target_date TIMESTAMPTZ)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+AS $$
+DECLARE
+    q_start TIMESTAMPTZ := date_trunc('quarter', target_date);
+    q_end   TIMESTAMPTZ := q_start + INTERVAL '3 months';
+    part    TEXT := format('bets_%s_q%s',
+                           to_char(q_start, 'YYYY'),
+                           to_char(q_start, 'Q'));
+BEGIN
+    EXECUTE format(
+        'CREATE TABLE IF NOT EXISTS %I PARTITION OF bets FOR VALUES FROM (%L) TO (%L)',
+        part, q_start, q_end
+    );
+END;
+$$;
+
+-- Provision the current and next quarter on demand.
+SELECT ensure_bets_partition(now());
+SELECT ensure_bets_partition(now() + INTERVAL '3 months');
+```
+
+```sql
+-- pg_cron: run on the 1st of every month at 03:00 UTC to provision upcoming quarters.
+SELECT cron.schedule(
+    'ensure-bets-partitions',
+    '0 3 1 * *',
+    $$SELECT ensure_bets_partition(now() + INTERVAL '3 months');$$
+);
+```
+
+### Maintenance Routine
+
+Because each partition is bounded to a single quarter, `VACUUM` and `REINDEX` operate on far smaller relations, keeping autovacuum responsive and index rebuilds fast. Run maintenance per partition:
+
+```sql
+-- Vacuum/analyze a single quarter without touching the rest of the table.
+VACUUM (ANALYZE) bets_2026_q1;
+
+-- Rebuild indexes for one quarter only.
+REINDEX TABLE bets_2026_q1;
+```
+
+To retire old data, detach the partition (cheap, metadata-only) and archive or drop it:
+
+```sql
+ALTER TABLE bets DETACH PARTITION bets_2025_q1;
+-- ...archive bets_2025_q1, then:
+DROP TABLE bets_2025_q1;
+```
+
+### Runbook Checklist
+
+- **Monthly:** confirm the `ensure-bets-partitions` `pg_cron` job is scheduled and succeeding (`SELECT * FROM cron.job_run_details ORDER BY start_time DESC LIMIT 5;`).
+- **Quarterly:** verify the upcoming quarter's partition exists (`\d+ bets` or query `pg_inherits`).
+- **Ongoing:** monitor `bets_default` — any rows landing there indicate a missing partition and should be backfilled into the correct quarter.
+- **Retention:** detach and archive partitions older than the retention window rather than deleting rows in place.
