@@ -1112,3 +1112,144 @@ fn test_council_vote_events() {
     assert_eq!(timelock_deadline, t.env.ledger().timestamp() + 86_400);
 }
 
+
+// ── Slippage / MEV protection (#288) ─────────────────────────────────────────
+
+#[test]
+fn test_place_bet_with_slippage_succeeds_when_pool_is_empty() {
+    // First bet on an empty pool acquires 100% share (10_000 bps),
+    // which must always pass any tolerance.
+    let t = setup();
+    let id = create_test_market(&t);
+    let bettor = Address::generate(&t.env);
+    fund_user(&t, &bettor, 1_000);
+
+    // 1% default tolerance (100 bps) — should pass on an empty pool
+    t.client.place_bet_with_slippage(&bettor, &id, &true, &1_000, &100u32);
+
+    let market = t.client.get_market(&id);
+    assert_eq!(market.total_yes, 1_000);
+}
+
+#[test]
+fn test_place_bet_with_slippage_succeeds_at_exact_tolerance() {
+    let t = setup();
+    let id = create_test_market(&t);
+
+    // Seed the pool: 9_000 YES already committed by another bettor.
+    let seeder = Address::generate(&t.env);
+    fund_user(&t, &seeder, 9_000);
+    t.client.place_bet(&seeder, &id, &true, &9_000);
+
+    // New bettor adds 1_000. New pool = 10_000. Share = 1_000/10_000 = 1_000 bps.
+    let bettor = Address::generate(&t.env);
+    fund_user(&t, &bettor, 1_000);
+
+    // Tolerance exactly 1_000 bps — should not revert.
+    t.client.place_bet_with_slippage(&bettor, &id, &true, &1_000, &1_000u32);
+
+    let market = t.client.get_market(&id);
+    assert_eq!(market.total_yes, 10_000);
+}
+
+#[test]
+#[should_panic(expected = "ContractError::SlippageExceeded")]
+fn test_place_bet_with_slippage_reverts_when_odds_shift() {
+    let t = setup();
+    let id = create_test_market(&t);
+
+    // A large frontrunner bet dominates the pool: 99_000 YES.
+    let frontrunner = Address::generate(&t.env);
+    fund_user(&t, &frontrunner, 99_000);
+    t.client.place_bet(&frontrunner, &id, &true, &99_000);
+
+    // Victim expects at least 50% share (5_000 bps) but will only get
+    // 1_000 / 100_000 = 100 bps — slippage check must revert.
+    let victim = Address::generate(&t.env);
+    fund_user(&t, &victim, 1_000);
+    t.client.place_bet_with_slippage(&victim, &id, &true, &1_000, &5_000u32);
+}
+
+#[test]
+#[should_panic(expected = "ContractError::InvalidSlippage")]
+fn test_place_bet_with_slippage_rejects_excessive_tolerance() {
+    let t = setup();
+    let id = create_test_market(&t);
+    let bettor = Address::generate(&t.env);
+    fund_user(&t, &bettor, 1_000);
+
+    // 5_001 bps exceeds the 5_000 bps maximum — must revert.
+    t.client.place_bet_with_slippage(&bettor, &id, &true, &1_000, &5_001u32);
+}
+
+#[test]
+fn test_place_bet_with_slippage_zero_uses_default_1_percent() {
+    // 0 tolerance means "use the default" (100 bps = 1%).
+    // A fresh-pool bet acquires 100% share and must pass.
+    let t = setup();
+    let id = create_test_market(&t);
+    let bettor = Address::generate(&t.env);
+    fund_user(&t, &bettor, 500);
+
+    t.client.place_bet_with_slippage(&bettor, &id, &false, &500, &0u32);
+
+    let market = t.client.get_market(&id);
+    assert_eq!(market.total_no, 500);
+}
+
+#[test]
+fn test_preview_shares_bps_matches_actual_acquisition() {
+    let t = setup();
+    let id = create_test_market(&t);
+
+    // Seed 9_000 YES.
+    let seeder = Address::generate(&t.env);
+    fund_user(&t, &seeder, 9_000);
+    t.client.place_bet(&seeder, &id, &true, &9_000);
+
+    // Preview: adding 1_000 to 9_000 → 10_000 pool → 1_000 bps.
+    let preview = t.client.preview_shares_bps(&id, &true, &1_000);
+    assert_eq!(preview, 1_000u32);
+
+    // Place with exactly that tolerance — must succeed.
+    let bettor = Address::generate(&t.env);
+    fund_user(&t, &bettor, 1_000);
+    t.client.place_bet_with_slippage(&bettor, &id, &true, &1_000, &preview);
+}
+
+#[test]
+fn test_place_bet_with_slippage_no_state_change_on_slippage_failure() {
+    // When SlippageExceeded is triggered, tokens must NOT have moved
+    // and market totals must be unchanged (the assert fires before transfer).
+    let t = setup();
+    let id = create_test_market(&t);
+
+    let frontrunner = Address::generate(&t.env);
+    fund_user(&t, &frontrunner, 99_000);
+    t.client.place_bet(&frontrunner, &id, &true, &99_000);
+
+    let victim = Address::generate(&t.env);
+    fund_user(&t, &victim, 1_000);
+    let victim_balance_before = t.xlm.balance(&victim);
+
+    let result = t.env.try_invoke_contract::<(), _>(
+        &t.market_id,
+        &soroban_sdk::Symbol::new(&t.env, "place_bet_with_slippage"),
+        soroban_sdk::vec![
+            &t.env,
+            victim.into_val(&t.env),
+            id.into_val(&t.env),
+            true.into_val(&t.env),
+            1_000i128.into_val(&t.env),
+            5_000u32.into_val(&t.env),
+        ],
+    );
+    assert!(result.is_err(), "expected revert");
+
+    // Balance unchanged — no tokens left the victim's account.
+    assert_eq!(t.xlm.balance(&victim), victim_balance_before);
+
+    // Market state unchanged.
+    let market = t.client.get_market(&id);
+    assert_eq!(market.total_yes, 99_000);
+}
