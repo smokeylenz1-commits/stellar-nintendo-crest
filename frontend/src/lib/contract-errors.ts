@@ -107,3 +107,35 @@ export function formatContractError(error: unknown): string | null {
 
   return `${info.message}. ${info.resolution}`;
 }
+
+/**
+ * Detects if the error is caused by user rejecting/declining the wallet transaction.
+ */
+export function isUserRejectionError(error: unknown): boolean {
+  if (error == null) return false;
+  const text = (
+    typeof error === "string"
+      ? error
+      : error instanceof Error
+        ? error.message
+        : String(error)
+  ).toLowerCase();
+
+  return (
+    text.includes("user declined") ||
+    text.includes("user rejected") ||
+    text.includes("transaction rejected") ||
+    text.includes("signing cancelled") ||
+    text.includes("rejection")
+  );
+}
+
+/**
+ * Formats a user-friendly wallet error message, surfacing cancellation gracefully.
+ */
+export function formatFriendlyWalletError(error: unknown): string {
+  if (isUserRejectionError(error)) {
+    return "Transaction cancelled in wallet";
+  }
+  return formatContractError(error) || "Transaction failed. Please try again.";
+}
