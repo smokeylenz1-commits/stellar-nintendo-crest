@@ -14,7 +14,13 @@ const WalletProvider = dynamic(
   }
 );
 
-export function Providers({ children }: { children: React.ReactNode }) {
+export function Providers({
+  children,
+  nonce,
+}: {
+  children: React.ReactNode;
+  nonce?: string;
+}) {
   return (
     <WalletProvider>
       <ToastProvider>{children}</ToastProvider>

@@ -4,9 +4,11 @@ import { useState, useCallback } from "react";
 import { placeBet } from "@/services/market";
 import { useWallet } from "@/hooks/useWallet";
 import type { TransactionResult, AppError } from "@/types";
+import type { PreSimulationResult } from "@/services/soroban";
 
 export type TxStage =
   | "idle"
+  | "simulating"
   | "building"
   | "signing"
   | "submitting"
@@ -33,6 +35,10 @@ interface UseBetResult {
   loading: boolean;
   stage: TxStage;
   error: string | null;
+  /** Estimated Soroban resource fee from pre-flight simulation (in XLM). */
+  estimatedFeeXLM: string | null;
+  /** Warning from pre-flight simulation when the tx is predicted to revert. */
+  simulationWarning: string | null;
   optimisticBet: OptimisticBet | null;
   reset: () => void;
 }
@@ -43,9 +49,9 @@ export function useBet(): UseBetResult {
   const [loading, setLoading] = useState(false);
   const [stage, setStage] = useState<TxStage>("idle");
   const [error, setError] = useState<string | null>(null);
-  const [optimisticBet, setOptimisticBet] = useState<OptimisticBet | null>(
-    null
-  );
+  const [estimatedFeeXLM, setEstimatedFeeXLM] = useState<string | null>(null);
+  const [simulationWarning, setSimulationWarning] = useState<string | null>(null);
+  const [optimisticBet, setOptimisticBet] = useState<OptimisticBet | null>(null);
 
   const submit = useCallback(
     async (
@@ -62,22 +68,48 @@ export function useBet(): UseBetResult {
       setLoading(true);
       setError(null);
       setResult(null);
-      setStage("building");
+      setSimulationWarning(null);
+      setEstimatedFeeXLM(null);
+      setStage("simulating");
 
-      // Optimistically render the bet as soon as the user signs, so the
-      // betting history and odds preview update instantly instead of waiting
-      // for ledger consensus.
       const optimisticId = `optimistic-${marketId}-${Date.now()}`;
-      setOptimisticBet({
-        id: optimisticId,
-        marketId,
-        isYes,
-        amount,
-        status: "pending",
-        createdAt: Date.now(),
-      });
 
       try {
+        // The onSimulated callback fires after pre-flight simulation and
+        // before the wallet modal opens. We use it to:
+        //   1. Surface the estimated resource fee in the UI.
+        //   2. Display an explicit warning if simulation predicts a revert,
+        //      and block the wallet prompt so the user avoids a wasted fee.
+        const onSimulated = async (sim: PreSimulationResult): Promise<boolean> => {
+          setEstimatedFeeXLM(sim.estimatedFeeXLM);
+
+          if (!sim.success && sim.simulationError) {
+            setSimulationWarning(sim.simulationError);
+            setLoading(false);
+            setStage("failed");
+            setError(
+              `Transaction would revert on-chain — no fee charged. Reason: ${sim.simulationError}`
+            );
+            return false; // block wallet popup
+          }
+
+          // Success: advance to building stage so the UI shows "Preparing tx…"
+          setStage("building");
+          return true;
+        };
+
+        // Optimistically render the bet as soon as the user signs, so the
+        // betting history and odds preview update instantly instead of waiting
+        // for ledger consensus.
+        setOptimisticBet({
+          id: optimisticId,
+          marketId,
+          isYes,
+          amount,
+          status: "pending",
+          createdAt: Date.now(),
+        });
+
         setStage("signing");
 
         const txResult = await placeBet(
@@ -86,7 +118,8 @@ export function useBet(): UseBetResult {
           isYes,
           amount,
           signTransaction,
-          minAcceptableOdds
+          minAcceptableOdds,
+          onSimulated
         );
 
         setStage("submitting");
@@ -94,7 +127,6 @@ export function useBet(): UseBetResult {
         if (txResult.success) {
           setStage("confirmed");
           setResult(txResult);
-          // Reconcile the optimistic entry once the on-chain event confirms.
           setOptimisticBet((prev) =>
             prev && prev.id === optimisticId
               ? { ...prev, status: "confirmed" }
@@ -104,7 +136,6 @@ export function useBet(): UseBetResult {
           setStage("failed");
           setError(txResult.error || "Transaction failed");
           setResult(txResult);
-          // Roll back the optimistic entry on failure.
           setOptimisticBet((prev) =>
             prev && prev.id === optimisticId ? null : prev
           );
@@ -114,7 +145,6 @@ export function useBet(): UseBetResult {
         console.error("[iPredict] useBet error:", err);
         let message: string;
         if (isAppError(err)) {
-          // Show details if available for more useful debugging
           message = err.details && err.details !== err.message
             ? `${err.message} — ${err.details}`
             : err.message;
@@ -124,7 +154,6 @@ export function useBet(): UseBetResult {
           message = String(err) || "Unknown error";
         }
         setError(message);
-        // Roll back the optimistic entry on error.
         setOptimisticBet((prev) =>
           prev && prev.id === optimisticId ? null : prev
         );
@@ -139,10 +168,22 @@ export function useBet(): UseBetResult {
     setResult(null);
     setError(null);
     setStage("idle");
+    setEstimatedFeeXLM(null);
+    setSimulationWarning(null);
     setOptimisticBet(null);
   }, []);
 
-  return { submit, result, loading, stage, error, optimisticBet, reset };
+  return {
+    submit,
+    result,
+    loading,
+    stage,
+    error,
+    estimatedFeeXLM,
+    simulationWarning,
+    optimisticBet,
+    reset,
+  };
 }
 
 function isAppError(err: unknown): err is AppError {

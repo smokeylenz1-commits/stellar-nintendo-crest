@@ -195,6 +195,7 @@ impl PredictionMarket {
     }
 
     pub fn place_bet(env: Env, bettor: Address, market_id: u64, side_yes: bool, amount: i128) {
+        // ── CHECKS ────────────────────────────────────────────────────────────
         bettor.require_auth();
         assert!(amount > 0, "amount must be positive");
         let mut market: Market = env
@@ -204,15 +205,13 @@ impl PredictionMarket {
             .expect("market not found");
         assert!(!market.resolved, "market already resolved");
 
-        let token_client = token::Client::new(&env, &market.token);
-        token_client.transfer(&bettor, &env.current_contract_address(), &amount);
-
         let mut position: Position = env
             .storage()
             .persistent()
             .get(&Self::position_key(&env, market_id, &bettor))
             .unwrap_or(Position { yes: 0, no: 0, claimed: false });
 
+        // ── EFFECTS — all state mutations before any external call ────────────
         if side_yes {
             market.total_yes += amount;
             position.yes += amount;
@@ -225,6 +224,10 @@ impl PredictionMarket {
         env.storage()
             .persistent()
             .set(&Self::position_key(&env, market_id, &bettor), &position);
+
+        // ── INTERACTION — external token transfer fires last ──────────────────
+        let token_client = token::Client::new(&env, &market.token);
+        token_client.transfer(&bettor, &env.current_contract_address(), &amount);
     }
 
     pub fn resolve_market(env: Env, admin: Address, market_id: u64, outcome: bool) {

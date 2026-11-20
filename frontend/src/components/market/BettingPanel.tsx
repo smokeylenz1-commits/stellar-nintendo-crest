@@ -37,7 +37,7 @@ interface BettingPanelProps {
 }
 
 function stageTxStep(stage: TxStage): "building" | "signing" | "submitting" | "confirmed" | "failed" {
-  if (stage === "idle") return "building";
+  if (stage === "idle" || stage === "simulating") return "building";
   return stage;
 }
 
@@ -48,7 +48,7 @@ export default function BettingPanel({
   onSuccess,
 }: BettingPanelProps) {
   const { publicKey, connected, signTransaction } = useWallet();
-  const { submit, result, loading, stage, error, reset } = useBet();
+  const { submit, result, loading, stage, error, estimatedFeeXLM, simulationWarning, reset } = useBet();
   const { showToast } = useToast();
 
   const [side, setSide] = useState<boolean>(userBet?.isYes ?? true);
@@ -298,9 +298,15 @@ export default function BettingPanel({
           <div className="border-t border-surface-border my-1" />
           <div className="flex items-center justify-between text-xs text-slate-600">
             <span>Network fee</span>
-            <span>{hasExistingBet ? "~0.003 XLM" : "~0.14 XLM first bet"}</span>
+            <span>
+              {estimatedFeeXLM
+                ? `~${estimatedFeeXLM} XLM (simulated)`
+                : hasExistingBet
+                  ? "~0.003 XLM"
+                  : "~0.14 XLM first bet"}
+            </span>
           </div>
-          {!hasExistingBet && (
+          {!hasExistingBet && !estimatedFeeXLM && (
             <p className="text-[11px] leading-snug text-slate-600">
               Your first bet on a market includes a one-time on-chain storage fee
               (~0.14 XLM, paid to the Stellar network). Every bet after that on
@@ -337,6 +343,18 @@ export default function BettingPanel({
         <TxProgress step={stageTxStep(stage)} />
       )}
 
+      {/* Simulation warning — shown when pre-flight predicts a revert */}
+      {simulationWarning && (
+        <div className="flex items-start gap-2 px-4 py-3 rounded-xl bg-yellow-500/10 border border-yellow-500/30 text-sm text-yellow-300">
+          <FiAlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-yellow-400" />
+          <div>
+            <p className="font-medium text-yellow-200 mb-0.5">Transaction would revert</p>
+            <p className="text-yellow-400 text-xs leading-snug">{simulationWarning}</p>
+            <p className="text-yellow-500 text-xs mt-1">No fee will be charged — the wallet was not opened.</p>
+          </div>
+        </div>
+      )}
+
       {/* Error message */}
       {error && (
         <div className="px-4 py-2.5 rounded-xl bg-red-500/10 border border-red-500/20 text-sm text-red-400">
@@ -355,11 +373,13 @@ export default function BettingPanel({
             ? "Connect Wallet"
             : !isActive
               ? "Market Closed"
-              : loading
-                ? "Processing..."
-                : hasExistingBet
-                  ? "Increase Position"
-                  : "Place Bet"}
+              : stage === "simulating"
+                ? "Simulating…"
+                : loading
+                  ? "Processing..."
+                  : hasExistingBet
+                    ? "Increase Position"
+                    : "Place Bet"}
         </button>
       ) : (
         <div className="space-y-3">

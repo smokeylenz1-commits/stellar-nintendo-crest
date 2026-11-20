@@ -58,3 +58,11 @@ backups/
 wal-archive/
 *.dump
 *.sql.gz
+
+# ── Terraform ─────────────────────────────────────────────────────────────────
+# terraform.tfvars contains credentials (API tokens) — never commit.
+infra/cloudflare/terraform.tfvars
+infra/cloudflare/.terraform/
+infra/cloudflare/.terraform.lock.hcl
+infra/cloudflare/terraform.tfstate
+infra/cloudflare/terraform.tfstate.backup

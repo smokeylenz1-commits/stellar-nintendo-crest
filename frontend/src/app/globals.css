@@ -1,4 +1,6 @@
-@import url("https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&display=swap");
+/* Google Fonts are loaded via <link> in layout.tsx with crossOrigin="anonymous"
+   for Subresource Integrity compatibility. The @import was removed to consolidate
+   font loading through a single auditable entry point (issue #289). */
 
 @tailwind base;
 @tailwind components;

@@ -5,6 +5,7 @@ import {
 } from "@stellar/stellar-sdk";
 import { MARKET_CONTRACT_ID } from "@/config/network";
 import { buildAndSendTx, simulateTransaction, getSimulationSource } from "@/services/soroban";
+import type { PreSimulationResult } from "@/services/soroban";
 import * as cache from "@/services/cache";
 import { getDisplayName } from "@/services/referral";
 import type { Market, Bet, MarketCategory, TransactionResult } from "@/types";
@@ -333,7 +334,8 @@ export async function createMarket(
   imageUrl: string,
   category: MarketCategory,
   durationSecs: number,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const result = await buildAndSendTx(
     publicKey,
@@ -346,7 +348,8 @@ export async function createMarket(
       categoryVal(category),
       u64Val(durationSecs),
     ],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -361,7 +364,8 @@ export async function placeBet(
   isYes: boolean,
   amount: number,
   signTransaction: (txXdr: string) => Promise<string>,
-  minAcceptableOdds?: number
+  minAcceptableOdds?: number,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const method = minAcceptableOdds !== undefined ? "place_bet_with_slippage" : "place_bet";
   const args = [
@@ -377,7 +381,8 @@ export async function placeBet(
     MARKET_CONTRACT_ID,
     method,
     args,
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -394,14 +399,16 @@ export async function placeBet(
 export async function finalizeMarket(
   publicKey: string,
   marketId: number,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const result = await buildAndSendTx(
     publicKey,
     MARKET_CONTRACT_ID,
     "finalize_market",
     [addressVal(publicKey), u64Val(marketId)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -415,14 +422,16 @@ export async function resolveMarket(
   publicKey: string,
   marketId: number,
   outcome: boolean,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const result = await buildAndSendTx(
     publicKey,
     MARKET_CONTRACT_ID,
     "resolve_market",
     [addressVal(publicKey), u64Val(marketId), boolVal(outcome)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -435,14 +444,16 @@ export async function resolveMarket(
 export async function cancelMarket(
   publicKey: string,
   marketId: number,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const result = await buildAndSendTx(
     publicKey,
     MARKET_CONTRACT_ID,
     "cancel_market",
     [addressVal(publicKey), u64Val(marketId)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -461,14 +472,16 @@ export async function cancelMarket(
 export async function cancelRefund(
   publicKey: string,
   marketId: number,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const result = await buildAndSendTx(
     publicKey,
     MARKET_CONTRACT_ID,
     "cancel_refund",
     [addressVal(publicKey), u64Val(marketId)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -482,14 +495,16 @@ export async function cancelRefund(
 export async function claim(
   publicKey: string,
   marketId: number,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const result = await buildAndSendTx(
     publicKey,
     MARKET_CONTRACT_ID,
     "claim",
     [addressVal(publicKey), u64Val(marketId)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -504,14 +519,16 @@ export async function claim(
 export async function withdrawFees(
   callerPublicKey: string,
   recipientAddress: string,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const result = await buildAndSendTx(
     callerPublicKey,
     MARKET_CONTRACT_ID,
     "withdraw_fees",
     [addressVal(callerPublicKey), addressVal(recipientAddress)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 
   if (result.success) {
@@ -523,41 +540,47 @@ export async function withdrawFees(
 export async function addResolver(
   adminPublicKey: string,
   resolverAddress: string,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   return buildAndSendTx(
     adminPublicKey,
     MARKET_CONTRACT_ID,
     "add_resolver",
     [addressVal(adminPublicKey), addressVal(resolverAddress)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 }
 
 export async function removeResolver(
   adminPublicKey: string,
   resolverAddress: string,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   return buildAndSendTx(
     adminPublicKey,
     MARKET_CONTRACT_ID,
     "remove_resolver",
     [addressVal(adminPublicKey), addressVal(resolverAddress)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 }
 
 export async function addFeeRecipient(
   adminPublicKey: string,
   recipientAddress: string,
-  signTransaction: (txXdr: string) => Promise<string>
+  signTransaction: (txXdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   return buildAndSendTx(
     adminPublicKey,
     MARKET_CONTRACT_ID,
     "add_fee_recipient",
     [addressVal(adminPublicKey), addressVal(recipientAddress)],
-    signTransaction
+    signTransaction,
+    onSimulated
   );
 }

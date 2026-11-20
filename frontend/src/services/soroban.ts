@@ -137,7 +137,90 @@ async function pollTransaction(
   );
 }
 
-// ── Core: buildAndSendTx ──────────────────────────────────────────────────────
+// ── Pre-flight transaction simulation ────────────────────────────────────────
+
+/**
+ * Simulate a state-changing contract call BEFORE opening the wallet modal.
+ *
+ * Returns the estimated Soroban resource fee (in stroops) on success, or a
+ * descriptive error string if the simulation predicts the transaction will
+ * revert on-chain. Callers can surface the fee to the user and block the
+ * wallet prompt on a predicted failure.
+ *
+ * Uses `server.simulateTransaction` (the lower-level call) rather than
+ * `server.prepareTransaction` so we get the raw simulation result without
+ * modifying the transaction object — the actual `buildAndSendTx` will run
+ * its own prepare step with the definitive sequence number.
+ */
+export interface PreSimulationResult {
+  /** True when the network simulation predicts the tx will succeed. */
+  success: boolean;
+  /**
+   * Estimated Soroban resource fee in stroops.
+   * Provided on both success and failure (best-effort on failure).
+   */
+  estimatedFeeSroops: number;
+  /** Estimated resource fee in XLM (human-readable). */
+  estimatedFeeXLM: string;
+  /** Error message if the simulation predicts a revert, undefined otherwise. */
+  simulationError?: string;
+}
+
+export async function preSimulateTransaction(
+  publicKey: string,
+  contractId: string,
+  method: string,
+  args: xdr.ScVal[]
+): Promise<PreSimulationResult> {
+  const server = getSorobanServer();
+
+  try {
+    const sourceAccount = await getSimAccount(publicKey);
+    const contract = new Contract(contractId);
+    const operation = contract.call(method, ...args);
+
+    const tx = new TransactionBuilder(sourceAccount, {
+      fee: "100",
+      networkPassphrase: getNetworkPassphrase(),
+    })
+      .addOperation(operation)
+      .setTimeout(300)
+      .build();
+
+    const simResponse = await server.simulateTransaction(tx);
+
+    // Extract resource fee (best-effort: may be absent on error)
+    const minResourceFee =
+      rpc.Api.isSimulationSuccess(simResponse)
+        ? parseInt((simResponse as rpc.Api.SimulateTransactionSuccessResponse).minResourceFee ?? "0", 10)
+        : 0;
+
+    if (rpc.Api.isSimulationError(simResponse)) {
+      return {
+        success: false,
+        estimatedFeeSroops: minResourceFee,
+        estimatedFeeXLM: (minResourceFee / 1e7).toFixed(7).replace(/\.?0+$/, ""),
+        simulationError: simResponse.error,
+      };
+    }
+
+    return {
+      success: true,
+      estimatedFeeSroops: minResourceFee,
+      estimatedFeeXLM: (minResourceFee / 1e7).toFixed(7).replace(/\.?0+$/, ""),
+    };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return {
+      success: false,
+      estimatedFeeSroops: 0,
+      estimatedFeeXLM: "0",
+      simulationError: `Pre-simulation failed: ${message}`,
+    };
+  }
+}
+
+
 
 /**
  * Build, simulate, sign, and submit a Soroban contract call transaction.
@@ -147,6 +230,9 @@ async function pollTransaction(
  * @param method — Contract function name
  * @param args — Array of xdr.ScVal arguments
  * @param signTransaction — Wallet sign function (XDR in → signed XDR out)
+ * @param onSimulated — Optional callback fired after pre-simulation, before the
+ *   wallet modal opens. Receives a {@link PreSimulationResult} with the
+ *   estimated fee and any predicted error. Return `false` to abort.
  * @returns TransactionResult with success status and hash or error
  */
 export async function buildAndSendTx(
@@ -154,11 +240,43 @@ export async function buildAndSendTx(
   contractId: string,
   method: string,
   args: xdr.ScVal[],
-  signTransaction: (xdr: string) => Promise<string>
+  signTransaction: (xdr: string) => Promise<string>,
+  onSimulated?: (result: PreSimulationResult) => Promise<boolean> | boolean
 ): Promise<TransactionResult> {
   const server = getSorobanServer();
 
   try {
+    // 0. Pre-flight simulation — run before touching the wallet so we can
+    //    detect predicted reverts and surface the accurate resource fee to the
+    //    user before the signing modal appears.
+    const simResult = await preSimulateTransaction(publicKey, contractId, method, args);
+
+    if (!simResult.success) {
+      console.warn("[iPredict] Pre-simulation predicts revert:", simResult.simulationError);
+      // If a callback is registered, let it decide whether to proceed
+      // (e.g. show a warning dialog). Without a callback, block immediately.
+      if (onSimulated) {
+        const proceed = await onSimulated(simResult);
+        if (!proceed) {
+          return {
+            success: false,
+            error: `Transaction would revert: ${simResult.simulationError}`,
+          };
+        }
+      } else {
+        return {
+          success: false,
+          error: `Transaction would revert on-chain: ${simResult.simulationError}`,
+        };
+      }
+    } else if (onSimulated) {
+      // Success path: notify caller of the estimated fee (they may display it).
+      // If callback returns false the user deliberately cancelled.
+      const proceed = await onSimulated(simResult);
+      if (!proceed) {
+        return { success: false, error: "Transaction cancelled before signing" };
+      }
+    }
     // 1. Load the source account (for sequence number)
     const sourceAccount = await server.getAccount(publicKey);
 
