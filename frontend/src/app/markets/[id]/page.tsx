@@ -23,7 +23,7 @@ import Skeleton from "@/components/ui/Skeleton";
 import TxProgress from "@/components/ui/TxProgress";
 import ErrorBoundary from "@/components/ui/ErrorBoundary";
 import type { MarketEvent } from "@/types";
-import { FiClock, FiUsers, FiTrendingUp, FiAward, FiArrowLeft } from "react-icons/fi";
+import { FiClock, FiUsers, FiTrendingUp, FiAward, FiArrowLeft, FiAlertTriangle } from "react-icons/fi";
 import Link from "next/link";
 
 function getStatusBadge(market: { resolved: boolean; outcome: boolean; cancelled: boolean }) {
@@ -32,6 +32,13 @@ function getStatusBadge(market: { resolved: boolean; outcome: boolean; cancelled
     ? { variant: "won" as const, label: "Resolved YES" }
     : { variant: "lost" as const, label: "Resolved NO" };
   return { variant: "active" as const, label: "Active" };
+}
+
+function formatChallengeRemaining(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  return `${hours}h ${minutes}m`;
 }
 
 export default function MarketDetailPage({
@@ -47,6 +54,7 @@ export default function MarketDetailPage({
 
   const [events, setEvents] = useState<MarketEvent[]>([]);
   const [xlmBalance, setXlmBalance] = useState(0);
+  const [now, setNow] = useState(() => Date.now());
 
   // Fetch native XLM balance for betting
   useEffect(() => {
@@ -69,6 +77,24 @@ export default function MarketDetailPage({
     }).catch(() => { });
     return () => { mounted = false; };
   }, [marketId]);
+
+  // Real-time tick for the optimistic resolution challenge window
+  const challengeWindowEnd = (market as any)?.disputeWindowEnd as number | undefined;
+  const challengeWindowActive = !!challengeWindowEnd && challengeWindowEnd > now;
+
+  useEffect(() => {
+    if (!challengeWindowEnd) return;
+    const interval = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(interval);
+  }, [challengeWindowEnd]);
+
+  // Auto-refresh market status when the challenge window closes
+  useEffect(() => {
+    if (!challengeWindowEnd) return;
+    if (challengeWindowEnd <= now) {
+      refetch();
+    }
+  }, [challengeWindowEnd, now, refetch]);
 
   const handleClaim = useCallback(async () => {
     await claimReward(marketId);
@@ -167,6 +193,41 @@ export default function MarketDetailPage({
                   {market.question}
                 </h1>
 
+                {/* Optimistic resolution challenge window */}
+                {challengeWindowActive && (
+                  <div className="mb-4 rounded-xl border border-amber-500/40 bg-amber-500/10 p-4">
+                    <div className="flex items-center gap-2 mb-2">
+                      <FiAlertTriangle className="w-4 h-4 text-amber-400" />
+                      <span className="font-heading font-semibold text-amber-300">
+                        Challenge Window Closes in {formatChallengeRemaining(challengeWindowEnd! - now)}
+                      </span>
+                    </div>
+                    <div className="h-2 w-full rounded-full bg-slate-700 overflow-hidden">
+                      <div
+                        className="h-full bg-amber-400 transition-all duration-1000 ease-linear"
+                        style={{
+                          width: `${Math.min(
+                            100,
+                            Math.max(
+                              0,
+                              ((challengeWindowEnd! - now) / (24 * 60 * 60 * 1000)) * 100
+                            )
+                          )}%`,
+                        }}
+                      />
+                    </div>
+                    {(market as any)?.canChallenge && (
+                      <button
+                        type="button"
+                        className="btn-secondary text-sm mt-3 inline-flex items-center gap-2"
+                        onClick={() => refetch()}
+                      >
+                        <FiAlertTriangle className="w-4 h-4" /> Challenge Outcome
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {/* Countdown */}
                 {!market.resolved && !market.cancelled && (
                   <div className="flex items-center gap-2 mb-4">
@@ -208,145 +269,6 @@ export default function MarketDetailPage({
             </div>
           </ErrorBoundary>
 
-          {/* User's existing bet */}
-          {userBet && (
-            <div className="card border-primary-500/20">
-              <div className="flex items-center gap-2 mb-2">
-                <FiTrendingUp className="w-4 h-4 text-primary-400" />
-                <span className="text-sm text-slate-400">Your Position</span>
-              </div>
-              <p className="font-heading font-semibold">
-                {displayXLM(userBet.amount)} on{" "}
-                <span className={userBet.isYes ? "text-accent-green" : "text-accent-red"}>
-                  {userBet.isYes ? "YES" : "NO"}
-                </span>
-              </p>
-            </div>
-          )}
+          {/* User's existing
 
-          {/* Claim Section */}
-          {canClaim && (
-            <ErrorBoundary fallbackTitle="Claim section error">
-              <div className={`card border ${won ? "border-accent-green/30 bg-accent-green/5" : market.cancelled ? "border-primary-500/30" : "border-accent-red/30 bg-accent-red/5"}`}>
-                <div className="flex items-center gap-2 mb-3">
-                  <FiAward className="w-5 h-5 text-primary-400" />
-                  <h3 className="font-heading font-semibold text-lg">
-                    {market.cancelled
-                      ? "Market Cancelled — Claim Refund"
-                      : won
-                        ? "You Won!"
-                        : "You Lost — Claim Consolation"}
-                  </h3>
-                </div>
-
-                {/* Reward breakdown */}
-                <div className="grid grid-cols-2 sm:grid-cols-3 gap-3 mb-4">
-                  {winnerPayout > 0 && (
-                    <div className="p-3 rounded-xl bg-surface-hover/50">
-                      <span className="text-xs text-slate-500">XLM Payout</span>
-                      <p className="font-semibold text-accent-green">
-                        {displayXLM(winnerPayout)}
-                      </p>
-                    </div>
-                  )}
-                  {market.cancelled && userBet && (
-                    <div className="p-3 rounded-xl bg-surface-hover/50">
-                      <span className="text-xs text-slate-500">XLM Refund</span>
-                      <p className="font-semibold text-accent-green">
-                        {displayXLM(userBet.amount)}
-                      </p>
-                    </div>
-                  )}
-                  <div className="p-3 rounded-xl bg-surface-hover/50">
-                    <span className="text-xs text-slate-500">Points</span>
-                    <p className="font-semibold text-primary-400">
-                      +{won ? WIN_POINTS : LOSE_POINTS}
-                    </p>
-                  </div>
-                  <div className="p-3 rounded-xl bg-surface-hover/50">
-                    <span className="text-xs text-slate-500">IPREDICT</span>
-                    <p className="font-semibold text-primary-400">
-                      +{won ? WIN_TOKENS : LOSE_TOKENS}
-                    </p>
-                  </div>
-                </div>
-
-                {claiming ? (
-                  <TxProgress step={claimStage === "idle" ? "building" : claimStage} />
-                ) : (
-                  <button onClick={handleClaim} className="btn-primary w-full">
-                    Claim Rewards
-                  </button>
-                )}
-                {claimError && (
-                  <p className="text-sm text-accent-red mt-2">{claimError}</p>
-                )}
-              </div>
-            </ErrorBoundary>
-          )}
-
-          {/* Already claimed */}
-          {userBet?.claimed && (
-            <div className="card border-primary-500/10 text-center py-8">
-              <FiAward className="w-8 h-8 text-primary-400 mx-auto mb-2" />
-              <p className="text-slate-400">Rewards already claimed</p>
-            </div>
-          )}
-
-          {/* Activity Feed */}
-          {events.length > 0 && (
-            <div className="card">
-              <h3 className="font-heading font-semibold mb-4">Recent Activity</h3>
-              <div className="space-y-3">
-                {events.map((evt, i) => (
-                  <div key={`${evt.txHash}-${i}`} className="flex items-center gap-3 text-sm">
-                    <div className="w-8 h-8 rounded-full bg-surface-hover flex items-center justify-center shrink-0">
-                      {evt.type === "bet_placed" ? (
-                        <FiTrendingUp className="w-3.5 h-3.5 text-primary-400" />
-                      ) : (
-                        <FiAward className="w-3.5 h-3.5 text-accent-green" />
-                      )}
-                    </div>
-                    <div className="min-w-0 flex-1">
-                      <span className="text-slate-300">{truncateAddress(evt.user)}</span>{" "}
-                      <span className="text-slate-500">
-                        {evt.type === "bet_placed"
-                          ? `bet ${evt.amount ? formatXLM(BigInt(evt.amount)) : ""}`
-                          : evt.type === "reward_claimed"
-                            ? "claimed reward"
-                            : evt.type.replace(/_/g, " ")}
-                      </span>
-                    </div>
-                    <span className="text-xs text-slate-600 shrink-0">
-                      {new Date(evt.timestamp * 1000).toLocaleTimeString()}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-        </div>
-
-        {/* Right: Betting Panel */}
-        <div className="lg:col-span-1">
-          <ErrorBoundary fallbackTitle="Betting panel error">
-            <div className="lg:sticky lg:top-24">
-              <BettingPanel
-                market={market}
-                userBet={userBet}
-                balance={balance}
-                onSuccess={() => {
-                  refetch();
-                  // Refresh XLM balance after bet
-                  if (publicKey) {
-                    getXlmBalance(publicKey).then(setXlmBalance);
-                  }
-                }}
-              />
-            </div>
-          </ErrorBoundary>
-        </div>
-      </div>
-    </div>
-  );
-}
+/* … truncated 6118 chars — edit only what you need near the top … */
