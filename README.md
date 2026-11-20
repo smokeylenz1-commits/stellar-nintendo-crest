@@ -297,3 +297,9 @@ pg_ctl -D "$PGDATA" -w stop
 
 <!-- handsoff-issue-113 -->
 - #113: feat(monitoring): configure alert rules for stuck markets (>48h past expiry) and council inactivity
+
+<!-- handsoff-issue-197 -->
+- #197: feat(contracts): implement dynamic timelock duration based on market dispute escalation level
+
+<!-- handsoff-issue-200 -->
+- #200: fix(contracts): guard referral bonus minting against circular and self-referral exploits

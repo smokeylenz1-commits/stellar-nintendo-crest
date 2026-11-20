@@ -12,6 +12,8 @@ pub enum TokenError {
     InsufficientBalance = 4,
     InvalidAmount       = 5,
     NotAdmin            = 6,
+    NoVestingSchedule   = 7,
+    NothingToClaim      = 8,
 }
 
 #[contracttype]
@@ -24,6 +26,19 @@ pub enum DataKey {
     Name,
     Symbol,
     Decimals,
+    Vesting(Address),
+}
+
+/// Linear vesting schedule for council reward tokens (#198).
+/// Tokens unlock linearly from `start` over `duration` seconds; `claimed`
+/// tracks how much of the vested amount has already been paid out.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VestingSchedule {
+    pub start: u64,
+    pub duration: u64,
+    pub total: i128,
+    pub claimed: i128,
 }
 
 #[contract]
@@ -128,6 +143,90 @@ impl IPredictTokenContract {
         Ok(())
     }
 
+    /// Creates a linear vesting schedule for `beneficiary` (#198). Admin only.
+    /// `duration` is configurable (e.g. 30 days for council rewards). The vested
+    /// tokens are minted into the contract's own balance so they can be claimed
+    /// progressively via `claim_vested`.
+    pub fn create_vesting_schedule(
+        env: Env,
+        beneficiary: Address,
+        total: i128,
+        duration: u64,
+    ) -> Result<(), TokenError> {
+        let admin: Address = Self::require_admin(&env)?;
+        admin.require_auth();
+        if total <= 0 || duration == 0 {
+            return Err(TokenError::InvalidAmount);
+        }
+        let schedule = VestingSchedule {
+            start: env.ledger().timestamp(),
+            duration,
+            total,
+            claimed: 0,
+        };
+        env.storage().persistent().set(&DataKey::Vesting(beneficiary.clone()), &schedule);
+        let contract_balance = Self::balance(env.clone(), env.current_contract_address());
+        env.storage().persistent().set(
+            &DataKey::Balance(env.current_contract_address()),
+            &(contract_balance + total),
+        );
+        let supply: i128 = env.storage().instance().get(&DataKey::TotalSupply).unwrap_or(0);
+        env.storage().instance().set(&DataKey::TotalSupply, &(supply + total));
+        Ok(())
+    }
+
+    /// Returns the beneficiary's vesting schedule, if any.
+    pub fn vesting_schedule(env: Env, beneficiary: Address) -> Option<VestingSchedule> {
+        env.storage().persistent().get(&DataKey::Vesting(beneficiary))
+    }
+
+    /// Total amount vested (unlocked) so far for `beneficiary`.
+    pub fn vested_balance(env: Env, beneficiary: Address) -> i128 {
+        match env.storage().persistent().get::<DataKey, VestingSchedule>(&DataKey::Vesting(beneficiary)) {
+            Some(s) => Self::compute_vested(&env, &s),
+            None => 0,
+        }
+    }
+
+    /// Amount currently claimable (vested minus already claimed).
+    pub fn claimable_balance(env: Env, beneficiary: Address) -> i128 {
+        match env.storage().persistent().get::<DataKey, VestingSchedule>(&DataKey::Vesting(beneficiary)) {
+            Some(s) => Self::compute_vested(&env, &s) - s.claimed,
+            None => 0,
+        }
+    }
+
+    /// Transfers the currently claimable vested amount to `beneficiary`.
+    pub fn claim_vested(env: Env, beneficiary: Address) -> Result<i128, TokenError> {
+        beneficiary.require_auth();
+        let mut schedule: VestingSchedule = env.storage().persistent()
+            .get(&DataKey::Vesting(beneficiary.clone()))
+            .ok_or(TokenError::NoVestingSchedule)?;
+        let vested = Self::compute_vested(&env, &schedule);
+        let claimable = vested - schedule.claimed;
+        if claimable <= 0 {
+            return Err(TokenError::NothingToClaim);
+        }
+        let contract = env.current_contract_address();
+        let contract_balance = Self::balance(env.clone(), contract.clone());
+        if contract_balance < claimable {
+            return Err(TokenError::InsufficientBalance);
+        }
+        env.storage().persistent().set(&DataKey::Balance(contract), &(contract_balance - claimable));
+        let beneficiary_balance = Self::balance(env.clone(), beneficiary.clone());
+        env.storage().persistent().set(
+            &DataKey::Balance(beneficiary.clone()),
+            &(beneficiary_balance + claimable),
+        );
+        schedule.claimed += claimable;
+        env.storage().persistent().set(&DataKey::Vesting(beneficiary.clone()), &schedule);
+        env.events().publish(
+            (String::from_str(&env, "token"), String::from_str(&env, "vested_claimed")),
+            (beneficiary, claimable),
+        );
+        Ok(claimable)
+    }
+
     pub fn balance(env: Env, account: Address) -> i128 {
         env.storage().persistent().get(&DataKey::Balance(account)).unwrap_or(0)
     }
@@ -148,6 +247,18 @@ impl IPredictTokenContract {
 
     pub fn decimals(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Decimals).unwrap_or(7)
+    }
+
+    fn compute_vested(env: &Env, schedule: &VestingSchedule) -> i128 {
+        let now = env.ledger().timestamp();
+        if now <= schedule.start {
+            return 0;
+        }
+        let elapsed = now - schedule.start;
+        if elapsed >= schedule.duration {
+            return schedule.total;
+        }
+        (schedule.total * (elapsed as i128)) / (schedule.duration as i128)
     }
 
     fn require_admin(env: &Env) -> Result<Address, TokenError> {
