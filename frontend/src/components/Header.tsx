@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import { useTheme } from './ThemeProvider';
 
 type ConnectionStatus = 'live' | 'reconnecting' | 'offline';
 
@@ -87,6 +88,13 @@ export default function Header() {
 
   const { label, dotClass, chipClass } = statusConfig[status];
 
+  let themeObj: ReturnType<typeof useTheme> | null = null;
+  try {
+    themeObj = useTheme();
+  } catch {
+    themeObj = null;
+  }
+
   return (
     <header className="sticky top-0 z-50 w-full border-b border-white/10 bg-black/60 backdrop-blur">
       <div className="mx-auto flex h-14 max-w-7xl items-center justify-between px-4">
@@ -94,14 +102,27 @@ export default function Header() {
           Prediction Market
         </span>
 
-        <div
-          role="status"
-          aria-live="polite"
-          data-connection-status={status}
-          className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium ${chipClass}`}
-        >
-          <span className={`h-2 w-2 rounded-full ${dotClass}`} aria-hidden="true" />
-          {label}
+        <div className="flex items-center gap-3">
+          {themeObj && (
+            <button
+              type="button"
+              onClick={themeObj.toggleTheme}
+              aria-label={`Switch to ${themeObj.theme === 'dark' ? 'light' : 'dark'} mode`}
+              className="flex h-8 w-8 items-center justify-center rounded-lg border border-white/10 bg-white/5 text-sm transition-colors hover:bg-white/10"
+            >
+              {themeObj.theme === 'dark' ? '☀️' : '🌙'}
+            </button>
+          )}
+
+          <div
+            role="status"
+            aria-live="polite"
+            data-connection-status={status}
+            className={`flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium ${chipClass}`}
+          >
+            <span className={`h-2 w-2 rounded-full ${dotClass}`} aria-hidden="true" />
+            {label}
+          </div>
         </div>
       </div>
     </header>
