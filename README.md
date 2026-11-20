@@ -297,3 +297,6 @@ pg_ctl -D "$PGDATA" -w stop
 
 <!-- handsoff-issue-113 -->
 - #113: feat(monitoring): configure alert rules for stuck markets (>48h past expiry) and council inactivity
+
+<!-- handsoff-issue-192 -->
+- #192: feat(contracts): support multi-token collateral betting via Soroban SAC asset adapters
