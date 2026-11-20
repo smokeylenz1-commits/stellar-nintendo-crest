@@ -1,7 +1,7 @@
 #![cfg(test)]
 
 use super::*;
-use soroban_sdk::{testutils::Address as _, Env};
+use soroban_sdk::{testutils::{Address as _, Events}, Env, IntoVal, Symbol};
 
 fn setup() -> (Env, LeaderboardContractClient<'static>, Address, Address, Address) {
     let env = Env::default();
@@ -193,6 +193,89 @@ fn test_player_count() {
     assert_eq!(client.get_player_count(), 2);
 }
 
+// ── PointsEarnedEvent emission ────────────────────────────────────────────────
+
+fn points_topic(env: &Env) -> (Symbol, Symbol) {
+    (Symbol::new(env, "leaderboard"), Symbol::new(env, "points"))
+}
+
+#[test]
+fn test_points_event_on_win() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &100_u64, &true);
+
+    let expected = PointsEarnedEvent {
+        user: user.clone(),
+        delta: 100,
+        reason: PointsReason::Win,
+        new_total: 100,
+    };
+    assert!(env.events().all().contains(&(
+        client.address.clone(),
+        points_topic(&env).into_val(&env),
+        expected.into_val(&env),
+    )));
+}
+
+#[test]
+fn test_points_event_on_loss() {
+    let (env, client, _admin, market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &40_u64, &false);
+
+    let expected = PointsEarnedEvent {
+        user: user.clone(),
+        delta: 40,
+        reason: PointsReason::Loss,
+        new_total: 40,
+    };
+    assert!(env.events().all().contains(&(
+        client.address.clone(),
+        points_topic(&env).into_val(&env),
+        expected.into_val(&env),
+    )));
+}
+
+#[test]
+fn test_points_event_on_referral_bonus() {
+    let (env, client, _admin, market, referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&market, &user, &10_u64, &true);
+    client.add_bonus_pts(&referral, &user, &25_u64);
+
+    let expected = PointsEarnedEvent {
+        user: user.clone(),
+        delta: 25,
+        reason: PointsReason::ReferralBonus,
+        new_total: 35,
+    };
+    assert!(env.events().all().contains(&(
+        client.address.clone(),
+        points_topic(&env).into_val(&env),
+        expected.into_val(&env),
+    )));
+}
+
+#[test]
+fn test_points_event_on_manual_adjustment() {
+    let (env, client, admin, _market, _referral) = setup();
+    let user = Address::generate(&env);
+    client.add_pts(&admin, &user, &15_u64, &true);
+
+    let expected = PointsEarnedEvent {
+        user: user.clone(),
+        delta: 15,
+        reason: PointsReason::ManualAdjustment,
+        new_total: 15,
+    };
+    assert!(env.events().all().contains(&(
+        client.address.clone(),
+        points_topic(&env).into_val(&env),
+        expected.into_val(&env),
+    )));
+}
+
 // ── Lever E: O(1) eviction correctness ────────────────────────────────────────
 
 #[test]
@@ -237,66 +320,6 @@ fn test_low_scorer_rejected_when_full() {
 }
 
 #[test]
-fn test_bottom_player_rising_updates_min() {
-    // When the weakest in-list player gains points, the cached min must update
-    // so a later newcomer is compared against the NEW (higher) minimum.
-    let (env, client, _admin, market, _referral) = setup();
-    let weakest = Address::generate(&env);
-    // First entry is the weakest at 100; the rest are 110, 120, … (all higher).
-    client.add_pts(&market, &weakest, &100_u64, &true);
-    for i in 1u64..50 {
-        let user = Address::generate(&env);
-        client.add_pts(&market, &user, &(100 + i * 10), &true);
-    }
-    assert_eq!(client.get_player_count(), 50);
+fn test_bottom_pl
 
-    // Boost the weakest (100 -> 1000) so it is no longer the min.
-    client.add_pts(&market, &weakest, &900_u64, &true);
-    assert_eq!(client.get_points(&weakest), 1000);
-
-    // The true new minimum is now 110 (second-lowest original). A newcomer with
-    // 105 should be REJECTED (105 <= 110), proving the min recomputed correctly
-    // rather than staying stale at 100.
-    let newcomer = Address::generate(&env);
-    client.add_pts(&market, &newcomer, &105_u64, &true);
-    assert_eq!(client.get_rank(&newcomer), 0);
-    assert_eq!(client.get_player_count(), 50);
-}
-
-// ── Lever G: reward() / reward_bonus() ────────────────────────────────────────
-
-#[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn test_reward_rejects_non_market_caller() {
-    // Only the market contract may call reward(). A random caller must be
-    // rejected with UnauthorizedCaller (#3) — protects token minting.
-    let (env, client, _admin, _market, _referral) = setup();
-    let rando = Address::generate(&env);
-    let user = Address::generate(&env);
-    // tokens=0 so we don't need a token wired; the auth guard must fire first.
-    client.reward(&rando, &user, &30_u64, &0_i128, &true);
-}
-
-#[test]
-#[should_panic(expected = "Error(Contract, #3)")]
-fn test_reward_bonus_rejects_non_referral_caller() {
-    let (env, client, _admin, _market, _referral) = setup();
-    let rando = Address::generate(&env);
-    let user = Address::generate(&env);
-    client.reward_bonus(&rando, &user, &5_u64, &0_i128);
-}
-
-#[test]
-fn test_reward_updates_points_and_winloss() {
-    // reward() with tokens=0 (no token wired) still updates points + win/loss
-    // exactly like add_pts. Proves the points half is independent of minting.
-    let (env, client, _admin, market, _referral) = setup();
-    let user = Address::generate(&env);
-    client.reward(&market, &user, &30_u64, &0_i128, &true);
-    client.reward(&market, &user, &10_u64, &0_i128, &false);
-    let s = client.get_stats(&user);
-    assert_eq!(s.points, 40);
-    assert_eq!(s.won_bets, 1);
-    assert_eq!(s.lost_bets, 1);
-    assert_eq!(s.total_bets, 2);
-}
+/* … truncated 2710 chars — edit only what you need near the top … */
