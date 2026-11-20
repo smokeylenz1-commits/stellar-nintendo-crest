@@ -1,95 +1,256 @@
-/**
- * Oracle scheduler daemon (#35).
- *
- * Runs on a fixed interval. Each tick finds markets whose `ends_at` has passed while still open,
- * and hands each one to the resolution step. Every tick emits a heartbeat with its health
- * numbers. `stop()` ends the loop after the current tick finishes, and is wired to SIGTERM and
- * SIGINT, so shutdown is clean.
- */
+import { EventEmitter } from 'events';
 
-export interface ExpiredMarket {
-  id: number;
-  category: string;
-  endsAt: Date;
+export interface PriceSource {
+  name: string;
+  fetchPrice: () => Promise<number>;
 }
 
-export interface DaemonDeps {
-  findExpiredOpenMarkets(now: Date): Promise<ExpiredMarket[]>;
-  resolveMarket(market: ExpiredMarket): Promise<void>;
-  heartbeat(stats: DaemonHealth): void;
-  now?: () => Date;
-  setTimer?: (fn: () => void, ms: number) => unknown;
-  clearTimer?: (handle: unknown) => void;
+export interface AggregatedPrice {
+  median: number;
+  sources: { name: string; price: number; accepted: boolean }[];
+  proof: PriceProofPayload;
 }
 
-export interface DaemonHealth {
-  lastTickAt: string;
-  marketsSeen: number;
-  marketsResolved: number;
-  failures: number;
+export interface PriceProofPayload {
+  median: number;
+  timestamp: number;
+  acceptedSources: { name: string; price: number }[];
+  rejectedSources: { name: string; price: number; deviation: number }[];
 }
 
-export class OracleDaemon {
-  private timer: unknown;
-  private stopped = false;
-  private running: Promise<void> | undefined;
-  private health: DaemonHealth = { lastTickAt: "", marketsSeen: 0, marketsResolved: 0, failures: 0 };
+export interface MarketSubmitter {
+  submitPrice: (price: number, proof: PriceProofPayload) => Promise<void>;
+}
 
-  constructor(
-    private readonly deps: DaemonDeps,
-    private readonly intervalMs: number,
-  ) {}
+const MIN_SOURCES = 3;
+const MAX_DEVIATION = 0.03;
 
-  /** Starts the schedule. The first tick runs immediately. */
-  start(): void {
-    this.stopped = false;
-    this.running = this.tick();
-    const set = this.deps.setTimer ?? ((fn, ms) => setInterval(fn, ms));
-    this.timer = set(() => {
-      if (!this.running) {
-        this.running = this.tick().finally(() => {
-          this.running = undefined;
-        });
-      }
-    }, this.intervalMs);
+export class PriceAggregator {
+  private sources: PriceSource[];
+
+  constructor(sources: PriceSource[]) {
+    this.sources = sources;
   }
 
-  /** Stops scheduling and waits for the tick in progress to finish. */
-  async stop(): Promise<void> {
-    this.stopped = true;
-    const clear = this.deps.clearTimer ?? ((h) => clearInterval(h as ReturnType<typeof setInterval>));
-    clear(this.timer);
-    await this.running;
+  private static median(values: number[]): number {
+    const sorted = [...values].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    return sorted.length % 2 === 0
+      ? (sorted[mid - 1] + sorted[mid]) / 2
+      : sorted[mid];
   }
 
-  /** One pass: find expired markets and resolve each one. A failure is counted, not thrown. */
-  async tick(): Promise<void> {
-    if (this.stopped) return;
-    const now = (this.deps.now ?? (() => new Date()))();
-    const markets = await this.deps.findExpiredOpenMarkets(now);
-    this.health.lastTickAt = now.toISOString();
-    this.health.marketsSeen = markets.length;
+  async aggregate(): Promise<AggregatedPrice> {
+    const results = await Promise.allSettled(
+      this.sources.map(async (source) => ({
+        name: source.name,
+        price: await source.fetchPrice(),
+      })),
+    );
 
-    for (const market of markets) {
-      if (this.stopped) break;
-      try {
-        await this.deps.resolveMarket(market);
-        this.health.marketsResolved++;
-      } catch {
-        this.health.failures++;
+    const collected = results
+      .filter(
+        (r): r is PromiseFulfilledResult<{ name: string; price: number }> =>
+          r.status === 'fulfilled' && Number.isFinite(r.value.price) && r.value.price > 0,
+      )
+      .map((r) => r.value);
+
+    if (collected.length < MIN_SOURCES) {
+      throw new Error(
+        `PriceAggregator: need at least ${MIN_SOURCES} valid sources, got ${collected.length}`,
+      );
+    }
+
+    const median = PriceAggregator.median(collected.map((c) => c.price));
+
+    const accepted: { name: string; price: number }[] = [];
+    const rejected: { name: string; price: number; deviation: number }[] = [];
+
+    for (const entry of collected) {
+      const deviation = Math.abs(entry.price - median) / median;
+      if (deviation > MAX_DEVIATION) {
+        rejected.push({ name: entry.name, price: entry.price, deviation });
+      } else {
+        accepted.push({ name: entry.name, price: entry.price });
       }
     }
-    this.deps.heartbeat({ ...this.health });
+
+    if (accepted.length < MIN_SOURCES) {
+      throw new Error(
+        `PriceAggregator: only ${accepted.length} sources within ${MAX_DEVIATION * 100}% of median`,
+      );
+    }
+
+    const verifiedMedian = PriceAggregator.median(accepted.map((a) => a.price));
+
+    const proof: PriceProofPayload = {
+      median: verifiedMedian,
+      timestamp: Date.now(),
+      acceptedSources: accepted,
+      rejectedSources: rejected,
+    };
+
+    return {
+      median: verifiedMedian,
+      sources: collected.map((c) => ({
+        name: c.name,
+        price: c.price,
+        accepted: accepted.some((a) => a.name === c.name),
+      })),
+      proof,
+    };
   }
 }
 
-/** Wires SIGTERM and SIGINT to a clean stop. Returns a function that removes the handlers. */
-export function installShutdown(daemon: OracleDaemon, signals: NodeJS.Signals[] = ["SIGTERM", "SIGINT"]): () => void {
-  const handler = () => {
-    void daemon.stop();
-  };
-  for (const s of signals) process.on(s, handler);
-  return () => {
-    for (const s of signals) process.off(s, handler);
-  };
+export interface OracleDaemonConfig {
+  aggregator: PriceAggregator;
+  submitter: MarketSubmitter;
+  intervalMs: number;
+}
+
+export class OracleDaemon extends EventEmitter {
+  private config: OracleDaemonConfig;
+  private timer: NodeJS.Timeout | null = null;
+  private running = false;
+
+  constructor(config: OracleDaemonConfig) {
+    super();
+    this.config = config;
+  }
+
+  async tick(): Promise<void> {
+    const aggregated = await this.config.aggregator.aggregate();
+    await this.config.submitter.submitPrice(aggregated.median, aggregated.proof);
+    this.emit('submitted', aggregated);
+  }
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    const loop = async () => {
+      if (!this.running) return;
+      try {
+        await this.tick();
+      } catch (err) {
+        this.emit('error', err);
+      }
+      if (this.running) {
+        this.timer = setTimeout(loop, this.config.intervalMs);
+      }
+    };
+    void loop();
+  }
+
+  stop(): void {
+    this.running = false;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
+}
+
+export interface ProposedOutcome {
+  marketId: string;
+  proposedPrice: number;
+  proposedAt: number;
+}
+
+export interface OutcomeChallenger {
+  challengeOutcome: (marketId: string, bond: number) => Promise<void>;
+}
+
+export interface DisputeWebhook {
+  notify: (payload: DisputeAlertPayload) => Promise<void>;
+}
+
+export interface DisputeAlertPayload {
+  marketId: string;
+  proposedPrice: number;
+  canonicalPrice: number;
+  deviation: number;
+  bond: number;
+  challengedAt: number;
+}
+
+export interface DisputeBotConfig {
+  aggregator: PriceAggregator;
+  challenger: OutcomeChallenger;
+  webhook: DisputeWebhook;
+  intervalMs: number;
+  discrepancyThreshold: number;
+  challengeBond: number;
+}
+
+export class DisputeBot extends EventEmitter {
+  private config: DisputeBotConfig;
+  private timer: NodeJS.Timeout | null = null;
+  private running = false;
+
+  constructor(config: DisputeBotConfig) {
+    super();
+    this.config = config;
+  }
+
+  async evaluate(proposal: ProposedOutcome): Promise<boolean> {
+    const aggregated = await this.config.aggregator.aggregate();
+    const canonicalPrice = aggregated.median;
+    const deviation =
+      Math.abs(proposal.proposedPrice - canonicalPrice) / canonicalPrice;
+
+    if (deviation <= this.config.discrepancyThreshold) {
+      return false;
+    }
+
+    await this.config.challenger.challengeOutcome(
+      proposal.marketId,
+      this.config.challengeBond,
+    );
+
+    const alert: DisputeAlertPayload = {
+      marketId: proposal.marketId,
+      proposedPrice: proposal.proposedPrice,
+      canonicalPrice,
+      deviation,
+      bond: this.config.challengeBond,
+      challengedAt: Date.now(),
+    };
+
+    try {
+      await this.config.webhook.notify(alert);
+    } catch (err) {
+      this.emit('error', err);
+    }
+
+    this.emit('challenged', alert);
+    return true;
+  }
+
+  start(fetchProposals: () => Promise<ProposedOutcome[]>): void {
+    if (this.running) return;
+    this.running = true;
+    const loop = async () => {
+      if (!this.running) return;
+      try {
+        const proposals = await fetchProposals();
+        for (const proposal of proposals) {
+          await this.evaluate(proposal);
+        }
+      } catch (err) {
+        this.emit('error', err);
+      }
+      if (this.running) {
+        this.timer = setTimeout(loop, this.config.intervalMs);
+      }
+    };
+    void loop();
+  }
+
+  stop(): void {
+    this.running = false;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+  }
 }

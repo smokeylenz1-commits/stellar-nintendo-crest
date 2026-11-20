@@ -23,6 +23,11 @@ export interface ChallengerDeps {
   bondXlm: number;
   now: () => Date;
   challengeWindowMs: number;
+  /**
+   * Minimum number of adapter answers that must disagree with the submission before a challenge
+   * is posted. Defaults to 1 (any single divergence). Raise it to require corroboration.
+   */
+  discrepancyThreshold?: number;
 }
 
 export type ChallengeDecision =
@@ -48,8 +53,9 @@ export async function reviewSubmission(sub: PendingSubmission, deps: ChallengerD
     return { action: "no_answers", marketId: sub.marketId };
   }
 
-  const diverges = answers.some((a) => a !== sub.submittedOutcome);
-  if (!diverges) {
+  const threshold = Math.max(1, deps.discrepancyThreshold ?? 1);
+  const disagreements = answers.filter((a) => a !== sub.submittedOutcome).length;
+  if (disagreements < threshold) {
     return { action: "matches", marketId: sub.marketId };
   }
 
@@ -58,6 +64,9 @@ export async function reviewSubmission(sub: PendingSubmission, deps: ChallengerD
     marketId: sub.marketId,
     submittedOutcome: sub.submittedOutcome,
     adapterAnswers: answers,
+    disagreements,
+    threshold,
+    bondXlm: deps.bondXlm,
   });
   return { action: "challenged", marketId: sub.marketId };
 }

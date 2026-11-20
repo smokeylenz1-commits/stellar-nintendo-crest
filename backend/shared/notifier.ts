@@ -103,6 +103,38 @@ export class AlertNotifier {
     }
   }
 
+  /**
+   * Notify the operations team that the dispute bot submitted a challenge.
+   * Routes to the dedicated #oracle-disputes channel with the market, the
+   * proposed vs. canonical outcome, and the posted challenge bond.
+   */
+  async notifyChallengeSubmitted(params: {
+    marketId: string;
+    proposedOutcome: string;
+    canonicalOutcome: string;
+    discrepancyBps: number;
+    bondAmount: string;
+    txHash?: string;
+  }): Promise<boolean> {
+    return this.notify({
+      title: `Dispute challenge submitted for market ${params.marketId}`,
+      message:
+        `Automated dispute bot challenged a proposed outcome that contradicts ` +
+        `the canonical price feed (discrepancy ${params.discrepancyBps} bps).`,
+      severity: 'high',
+      channel: 'oracle-disputes',
+      link: `/markets/${params.marketId}`,
+      fields: {
+        'Market': params.marketId,
+        'Proposed outcome': params.proposedOutcome,
+        'Canonical outcome': params.canonicalOutcome,
+        'Discrepancy (bps)': params.discrepancyBps,
+        'Challenge bond': params.bondAmount,
+        ...(params.txHash ? { 'Tx hash': params.txHash } : {}),
+      },
+    });
+  }
+
   /** Token-bucket style limiter: at most `rateLimit` alerts per window. */
   private allow(channel: AlertChannel): boolean {
     const now = Date.now();
