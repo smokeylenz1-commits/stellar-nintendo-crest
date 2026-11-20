@@ -1,0 +1,14 @@
+# =============================================================================
+# certbot-renew.service – systemd one-shot service for certificate renewal
+# =============================================================================
+[Unit]
+Description=Certbot certificate renewal for iPredict
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash /opt/ipredict/infra/nginx/certbot-renew.sh
+# Rotate the renewal log weekly so it does not grow unboundedly
+StandardOutput=append:/var/log/certbot-renew.log
+StandardError=append:/var/log/certbot-renew.log

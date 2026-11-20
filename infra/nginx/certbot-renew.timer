@@ -1,0 +1,24 @@
+# =============================================================================
+# certbot-renew.timer – systemd timer for automated certificate renewal
+#
+# Install:
+#   sudo cp infra/nginx/certbot-renew.service /etc/systemd/system/
+#   sudo cp infra/nginx/certbot-renew.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now certbot-renew.timer
+#
+# Verify:
+#   systemctl list-timers certbot-renew.timer
+# =============================================================================
+[Unit]
+Description=Automatic Let's Encrypt certificate renewal for iPredict
+
+[Timer]
+# Run twice daily; certbot only acts when < 30 days remain
+OnCalendar=*-*-* 03:00:00
+OnCalendar=*-*-* 15:00:00
+RandomizedDelaySec=1800
+Persistent=true
+
+[Install]
+WantedBy=timers.target

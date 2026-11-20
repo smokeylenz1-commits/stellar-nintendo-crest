@@ -1,9 +1,13 @@
 version: 2
 updates:
+  # ── Rust / Cargo (contracts) ───────────────────────────────────────────────
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
@@ -14,10 +18,14 @@ updates:
         patterns:
           - "*"
 
+  # ── npm: frontend (Next.js) ────────────────────────────────────────────────
   - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"
@@ -28,10 +36,86 @@ updates:
         patterns:
           - "*"
 
+  # ── npm: backend ───────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/backend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "security"
+    groups:
+      security-patches:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── npm: indexer ───────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/indexer"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "security"
+    groups:
+      security-patches:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── npm: oracle ────────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/oracle"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "security"
+    groups:
+      security-patches:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── npm: db ────────────────────────────────────────────────────────────────
+  - package-ecosystem: "npm"
+    directory: "/db"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    labels:
+      - "dependencies"
+      - "security"
+    groups:
+      security-patches:
+        applies-to: security-updates
+        patterns:
+          - "*"
+
+  # ── GitHub Actions ─────────────────────────────────────────────────────────
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
     open-pull-requests-limit: 10
     labels:
       - "dependencies"

@@ -205,3 +205,128 @@ jobs:
       - name: Lint migrations
         working-directory: db
         run: npm run lint:migrations
+
+  # ── Job 5: Snyk vulnerability scanning ─────────────────────────────────────
+  snyk-scan:
+    name: Snyk vulnerability scan (${{ matrix.target.name }})
+    runs-on: ubuntu-latest
+    # Block PR merges when high/critical CVEs are found.
+    # Set continue-on-error: true if you want informational-only scans.
+    continue-on-error: false
+    permissions:
+      contents: read
+      security-events: write  # for uploading SARIF results to GitHub Security tab
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: frontend
+            path: frontend
+            type: npm
+          - name: backend
+            path: backend
+            type: npm
+          - name: indexer
+            path: indexer
+            type: npm
+          - name: oracle
+            path: oracle
+            type: npm
+          - name: db
+            path: db
+            type: npm
+          - name: contracts
+            path: contracts
+            type: cargo
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      # ── npm targets: install deps so Snyk can resolve the full tree ─────────
+      - name: Setup Node.js
+        if: matrix.target.type == 'npm'
+        uses: actions/setup-node@v7
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: ${{ matrix.target.path }}/package-lock.json
+
+      - name: Install npm dependencies
+        if: matrix.target.type == 'npm'
+        working-directory: ${{ matrix.target.path }}
+        run: npm ci
+
+      # ── Rust target: install toolchain so Snyk can parse Cargo.lock ─────────
+      - name: Install Rust toolchain
+        if: matrix.target.type == 'cargo'
+        uses: dtolnay/rust-toolchain@stable
+
+      # ── Snyk scan ────────────────────────────────────────────────────────────
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        if: matrix.target.type == 'npm'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >-
+            --severity-threshold=high
+            --file=${{ matrix.target.path }}/package.json
+            --sarif-file-output=snyk-${{ matrix.target.name }}.sarif
+
+      - name: Run Snyk to check Rust dependencies
+        uses: snyk/actions/rust@master
+        if: matrix.target.type == 'cargo'
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >-
+            --severity-threshold=high
+            --file=contracts/Cargo.toml
+            --sarif-file-output=snyk-${{ matrix.target.name }}.sarif
+
+      # ── Upload SARIF to GitHub Security tab ──────────────────────────────────
+      - name: Upload Snyk SARIF results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: snyk-${{ matrix.target.name }}.sarif
+
+      # ── Attach audit log to workflow summary ─────────────────────────────────
+      - name: Generate and attach audit log
+        if: always()
+        run: |
+          SARIF="snyk-${{ matrix.target.name }}.sarif"
+          SUMMARY="snyk-audit-${{ matrix.target.name }}.md"
+
+          echo "## Snyk audit: ${{ matrix.target.name }}" >> "$SUMMARY"
+          echo "" >> "$SUMMARY"
+          echo "| Field | Value |" >> "$SUMMARY"
+          echo "|---|---|" >> "$SUMMARY"
+          echo "| Target | \`${{ matrix.target.path }}\` |" >> "$SUMMARY"
+          echo "| Severity threshold | high + critical |" >> "$SUMMARY"
+          echo "| Scan time | $(date -u +%Y-%m-%dT%H:%M:%SZ) |" >> "$SUMMARY"
+          echo "" >> "$SUMMARY"
+
+          if [[ -f "$SARIF" ]]; then
+            VULN_COUNT=$(python3 -c "
+          import json, sys
+          data = json.load(open('$SARIF'))
+          count = sum(len(r.get('results', [])) for r in data.get('runs', []))
+          print(count)
+          " 2>/dev/null || echo "unknown")
+            echo "| Findings | $VULN_COUNT |" >> "$SUMMARY"
+          else
+            echo "| Findings | SARIF not generated (scan may have failed) |" >> "$SUMMARY"
+          fi
+
+          cat "$SUMMARY" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload audit log artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: snyk-audit-${{ matrix.target.name }}
+          path: snyk-audit-${{ matrix.target.name }}.md
+          retention-days: 30
