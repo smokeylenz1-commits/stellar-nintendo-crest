@@ -38,3 +38,46 @@ export function aggregateOutcomes(answers: Outcome[], options: AggregateOptions 
     tally,
   };
 }
+
+/**
+ * Resolves a market expiration timestamp to UTC Unix epoch seconds (#226).
+ *
+ * Accepts either a numeric epoch (seconds or milliseconds) or an ISO 8601 string that carries an
+ * explicit UTC offset (`Z` or `±HH:MM`). Ambiguous local date strings without an offset are
+ * rejected so that daylight saving transitions cannot shift a market's resolution window.
+ */
+export function resolveExpirationEpochSeconds(value: string | number): number {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error("expiration timestamp must be a finite number");
+    }
+    // Values this large are milliseconds; normalize everything to epoch seconds.
+    const seconds = Math.abs(value) >= 1e12 ? Math.floor(value / 1000) : Math.floor(value);
+    if (seconds < 0) {
+      throw new Error("expiration timestamp must not be before the Unix epoch");
+    }
+    return seconds;
+  }
+
+  const trimmed = value.trim();
+  if (trimmed === "") {
+    throw new Error("expiration timestamp must not be empty");
+  }
+
+  // Require an explicit UTC offset: `Z` or `±HH:MM` (also accept `±HHMM`).
+  if (!/(?:Z|[+-]\d{2}:?\d{2})$/i.test(trimmed)) {
+    throw new Error(
+      `ambiguous expiration timestamp "${value}": an explicit UTC offset (Z or ±HH:MM) is required`,
+    );
+  }
+
+  const ms = Date.parse(trimmed);
+  if (Number.isNaN(ms)) {
+    throw new Error(`invalid expiration timestamp "${value}"`);
+  }
+  const seconds = Math.floor(ms / 1000);
+  if (seconds < 0) {
+    throw new Error("expiration timestamp must not be before the Unix epoch");
+  }
+  return seconds;
+}

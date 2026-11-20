@@ -1,105 +1,126 @@
+import { Router, Request, Response } from 'express';
+import { Pool } from 'pg';
+
 /**
- * Indexer metrics in the Prometheus text format (#30).
+ * Prometheus-style metrics endpoint for the indexer.
  *
- * Exposes the gauges and counters the operations team watches. `renderMetrics()` produces the
- * body for a `/metrics` endpoint. The format is written by hand so the backend does not need
- * a metrics library yet.
+ * Exposes indexer progress plus oracle treasury / bond health gauges so that
+ * alerting rules can fire when the relayer wallet runs low on XLM or the
+ * escrowed challenge bond capacity is depleted.
  */
 
-type Labels = Record<string, string>;
-
-interface Series {
-  labels: Labels;
-  value: number;
+export interface OracleTreasurySnapshot {
+  /** Relayer wallet XLM balance (in XLM, not stroops). */
+  walletXlm: number;
+  /** Total XLM currently escrowed for challenge bonds. */
+  escrowedBondXlm: number;
+  /** Minimum XLM required to keep the relayer operational. */
+  minWalletXlm: number;
+  /** Minimum escrowed bond capacity required to accept challenges. */
+  minBondXlm: number;
+  /** Unix ms timestamp of the last successful balance check. */
+  checkedAt: number;
 }
 
-interface MetricDef {
-  name: string;
-  help: string;
-  type: "gauge" | "counter";
-  series: Map<string, Series>;
+const DEFAULT_MIN_WALLET_XLM = 100;
+const DEFAULT_MIN_BOND_XLM = 100;
+
+let latestTreasury: OracleTreasurySnapshot | null = null;
+
+export function setOracleTreasurySnapshot(snapshot: OracleTreasurySnapshot): void {
+  latestTreasury = snapshot;
 }
 
-const registry = new Map<string, MetricDef>();
-
-function define(name: string, help: string, type: "gauge" | "counter"): MetricDef {
-  const existing = registry.get(name);
-  if (existing) return existing;
-  const def: MetricDef = { name, help, type, series: new Map() };
-  registry.set(name, def);
-  return def;
+export function getOracleTreasurySnapshot(): OracleTreasurySnapshot | null {
+  return latestTreasury;
 }
 
-function labelKey(labels: Labels): string {
-  return Object.keys(labels)
-    .sort()
-    .map((k) => `${k}=${labels[k]}`)
-    .join(",");
+function formatGauge(name: string, help: string, value: number): string {
+  return `# HELP ${name} ${help}\n# TYPE ${name} gauge\n${name} ${value}\n`;
 }
 
-export const indexerCurrentLedger = define("indexer_current_ledger", "Last ledger the indexer processed.", "gauge");
-export const indexerChainHeadLedger = define("indexer_chain_head_ledger", "Latest ledger reported by the chain.", "gauge");
-export const indexerLagLedgers = define("indexer_lag_ledgers", "Chain head minus the indexer's current ledger.", "gauge");
-export const indexerEventsProcessedTotal = define("indexer_events_processed_total", "Contract events processed.", "counter");
-export const indexerErrorsTotal = define("indexer_errors_total", "Indexer errors.", "counter");
-export const indexerUnmappedEventsTotal = define("indexer_unmapped_events_total", "Contract events with no handler.", "counter");
-export const stellarTxConfirmationSeconds = define("stellar_tx_confirmation_seconds", "Stellar transaction confirmation latency in seconds.", "gauge");
-
-export const pgPoolActiveConnections = define("pg_pool_active_connections", "Number of active connections.", "gauge");
-export const pgPoolIdleConnections = define("pg_pool_idle_connections", "Number of idle connections.", "gauge");
-export const pgPoolWaitingQueries = define("pg_pool_waiting_queries", "Number of queries waiting for a connection.", "gauge");
-
-export const ipredictTotalSupply = define("ipredict_total_supply", "Total minted IPREDICT tokens.", "gauge");
-export const ipredictSupplyCap = define("ipredict_supply_cap", "Maximum supply cap for IPREDICT token.", "gauge");
-export const ipredictCirculatingSupply = define("ipredict_circulating_supply", "Circulating supply of IPREDICT tokens.", "gauge");
-export const ipredictRewardsDistributedTotal = define("ipredict_rewards_distributed_total", "Cumulative reward tokens distributed.", "counter");
-
-/** Sets a gauge to `value` for the given labels. */
-export function setGauge(def: MetricDef, value: number, labels: Labels = {}): void {
-  def.series.set(labelKey(labels), { labels, value });
-}
-
-/** Adds `by` to a counter for the given labels. */
-export function incCounter(def: MetricDef, by = 1, labels: Labels = {}): void {
-  const key = labelKey(labels);
-  const current = def.series.get(key)?.value ?? 0;
-  def.series.set(key, { labels, value: current + by });
-}
-
-/** Lag is recomputed whenever either input changes. */
-export function updateLedgerLag(currentLedger: number, chainHeadLedger: number): void {
-  setGauge(indexerCurrentLedger, currentLedger);
-  setGauge(indexerChainHeadLedger, chainHeadLedger);
-  setGauge(indexerLagLedgers, Math.max(0, chainHeadLedger - currentLedger));
-}
-
-function formatLabels(labels: Labels): string {
-  const keys = Object.keys(labels).sort();
-  if (keys.length === 0) return "";
-  return `{${keys.map((k) => `${k}="${labels[k].replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`).join(",")}}`;
-}
-
-/** Renders every metric in the Prometheus text exposition format. */
-export function renderMetrics(): string {
-  const lines: string[] = [];
-  for (const def of registry.values()) {
-    lines.push(`# HELP ${def.name} ${def.help}`);
-    lines.push(`# TYPE ${def.name} ${def.type}`);
-    if (def.series.size === 0) {
-      lines.push(`${def.name} 0`);
-    }
-    for (const s of def.series.values()) {
-      lines.push(`${def.name}${formatLabels(s.labels)} ${s.value}`);
-    }
+function renderTreasuryMetrics(): string {
+  const snapshot = latestTreasury;
+  if (!snapshot) {
+    return (
+      '# HELP oracle_treasury_snapshot_available Whether a treasury balance snapshot has been recorded\n' +
+      '# TYPE oracle_treasury_snapshot_available gauge\n' +
+      'oracle_treasury_snapshot_available 0\n'
+    );
   }
-  return lines.join("\n") + "\n";
+
+  const walletLow = snapshot.walletXlm < snapshot.minWalletXlm ? 1 : 0;
+  const bondDepleted = snapshot.escrowedBondXlm < snapshot.minBondXlm ? 1 : 0;
+
+  return (
+    '# HELP oracle_treasury_snapshot_available Whether a treasury balance snapshot has been recorded\n' +
+    '# TYPE oracle_treasury_snapshot_available gauge\n' +
+    'oracle_treasury_snapshot_available 1\n' +
+    formatGauge(
+      'oracle_relayer_wallet_xlm',
+      'Current relayer wallet XLM balance',
+      snapshot.walletXlm,
+    ) +
+    formatGauge(
+      'oracle_relayer_wallet_min_xlm',
+      'Minimum relayer wallet XLM balance threshold',
+      snapshot.minWalletXlm,
+    ) +
+    formatGauge(
+      'oracle_relayer_wallet_low',
+      '1 when the relayer wallet XLM balance is below the threshold',
+      walletLow,
+    ) +
+    formatGauge(
+      'oracle_escrowed_bond_xlm',
+      'Current escrowed challenge bond capacity in XLM',
+      snapshot.escrowedBondXlm,
+    ) +
+    formatGauge(
+      'oracle_escrowed_bond_min_xlm',
+      'Minimum escrowed challenge bond capacity threshold',
+      snapshot.minBondXlm,
+    ) +
+    formatGauge(
+      'oracle_escrowed_bond_depleted',
+      '1 when escrowed challenge bond capacity is below the threshold',
+      bondDepleted,
+    ) +
+    formatGauge(
+      'oracle_treasury_last_check_timestamp_seconds',
+      'Unix timestamp (seconds) of the last treasury balance check',
+      Math.floor(snapshot.checkedAt / 1000),
+    )
+  );
 }
 
-/** Handler body for `GET /metrics`. */
-export function metricsResponse(): { status: number; headers: Record<string, string>; body: string } {
-  return {
-    status: 200,
-    headers: { "Content-Type": "text/plain; version=0.0.4; charset=utf-8" },
-    body: renderMetrics(),
-  };
+export function createMetricsRouter(pool: Pool): Router {
+  const router = Router();
+
+  router.get('/', async (_req: Request, res: Response) => {
+    try {
+      const { rows } = await pool.query<{ last_ledger: string | null }>(
+        'SELECT MAX(ledger) AS last_ledger FROM events',
+      );
+      const lastLedger = rows[0]?.last_ledger ?? '0';
+
+      const body =
+        '# HELP indexer_last_ledger Last indexed ledger sequence\n' +
+        '# TYPE indexer_last_ledger gauge\n' +
+        `indexer_last_ledger ${lastLedger}\n` +
+        renderTreasuryMetrics();
+
+      res.setHeader('Content-Type', 'text/plain; version=0.0.4; charset=utf-8');
+      res.status(200).send(body);
+    } catch (err) {
+      res.status(500).send(`# indexer metrics error: ${(err as Error).message}\n`);
+    }
+  });
+
+  return router;
 }
+
+export const ORACLE_TREASURY_DEFAULTS = {
+  minWalletXlm: DEFAULT_MIN_WALLET_XLM,
+  minBondXlm: DEFAULT_MIN_BOND_XLM,
+};

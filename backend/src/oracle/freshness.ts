@@ -1,53 +1,87 @@
 /**
- * Freshness check and failover for adapter responses (#46).
+ * Oracle freshness helpers.
  *
- * A response is usable only when its `last_updated` timestamp is within the freshness window
- * (10 minutes by default). Stale responses are discarded. Adapters are tried in order, so the
- * secondary is used when the primary is stale. If every adapter is stale, nothing is submitted.
+ * All market expiration / resolution timestamps are evaluated strictly against
+ * UTC Unix epoch seconds. Ambiguous local date strings (no explicit UTC offset)
+ * are rejected so that daylight saving transitions and timezone offsets can
+ * never cause premature or delayed market resolutions.
  */
 
-export const FRESHNESS_WINDOW_MS = 10 * 60 * 1000;
+const ISO_UTC_WITH_OFFSET =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
 
-export interface TimedResponse<T> {
-  adapter: string;
-  value: T;
-  lastUpdated: string;
-}
+const EPOCH_SECONDS = /^-?\d+$/;
 
-export type FreshnessResult<T> =
-  | { status: "fresh"; adapter: string; value: T; discarded: string[] }
-  | { status: "all_stale"; discarded: string[] };
+/**
+ * Resolve an ISO 8601 timestamp (with explicit UTC offset) or a numeric epoch
+ * seconds value to UTC Unix epoch seconds.
+ *
+ * Throws on ambiguous local timezone strings (no explicit offset) and on
+ * invalid / out-of-range dates.
+ */
+export function resolveUtcEpochSeconds(input: string | number): number {
+  if (typeof input === 'number') {
+    if (!Number.isFinite(input) || !Number.isInteger(input)) {
+      throw new Error(`Invalid epoch seconds: ${input}`);
+    }
+    return input;
+  }
 
-/** True when `lastUpdated` is no older than the window, and not in the future. */
-export function isFresh(lastUpdated: string, now: number, windowMs = FRESHNESS_WINDOW_MS): boolean {
-  const t = Date.parse(lastUpdated);
-  if (Number.isNaN(t)) return false;
-  const age = now - t;
-  return age >= 0 && age <= windowMs;
+  if (typeof input !== 'string') {
+    throw new Error('Timestamp must be an ISO 8601 string or epoch seconds');
+  }
+
+  const value = input.trim();
+  if (value.length === 0) {
+    throw new Error('Timestamp must not be empty');
+  }
+
+  if (EPOCH_SECONDS.test(value)) {
+    const seconds = Number(value);
+    if (!Number.isSafeInteger(seconds)) {
+      throw new Error(`Epoch seconds out of range: ${value}`);
+    }
+    return seconds;
+  }
+
+  if (!ISO_UTC_WITH_OFFSET.test(value)) {
+    throw new Error(
+      `Ambiguous or unsupported timestamp "${value}": expected ISO 8601 with explicit UTC offset (Z or ±HH:MM) or epoch seconds`,
+    );
+  }
+
+  const millis = Date.parse(value);
+  if (!Number.isFinite(millis)) {
+    throw new Error(`Invalid timestamp: ${value}`);
+  }
+
+  return Math.floor(millis / 1000);
 }
 
 /**
- * Fetches from each adapter in order and returns the first fresh response. Stale or failing
- * responses are recorded as discarded.
+ * Resolve a timestamp to UTC Unix epoch milliseconds.
  */
-export async function fetchFresh<T>(
-  fetchers: Array<{ adapter: string; fetch: () => Promise<TimedResponse<T>> }>,
-  now: number = Date.now(),
-  windowMs = FRESHNESS_WINDOW_MS,
-): Promise<FreshnessResult<T>> {
-  const discarded: string[] = [];
-  for (const { adapter, fetch } of fetchers) {
-    let response: TimedResponse<T>;
-    try {
-      response = await fetch();
-    } catch {
-      discarded.push(`${adapter}: request failed`);
-      continue;
-    }
-    if (isFresh(response.lastUpdated, now, windowMs)) {
-      return { status: "fresh", adapter: response.adapter, value: response.value, discarded };
-    }
-    discarded.push(`${adapter}: stale (${response.lastUpdated})`);
-  }
-  return { status: "all_stale", discarded };
+export function resolveUtcEpochMillis(input: string | number): number {
+  return resolveUtcEpochSeconds(input) * 1000;
+}
+
+/**
+ * Compare two timestamps in UTC epoch seconds.
+ * Returns a negative number if a < b, positive if a > b, 0 if equal.
+ */
+export function compareUtcTimestamps(
+  a: string | number,
+  b: string | number,
+): number {
+  return resolveUtcEpochSeconds(a) - resolveUtcEpochSeconds(b);
+}
+
+/**
+ * Determine whether a market expiration timestamp has passed relative to now.
+ */
+export function isExpired(
+  expiresAt: string | number,
+  now: string | number = Math.floor(Date.now() / 1000),
+): boolean {
+  return resolveUtcEpochSeconds(expiresAt) <= resolveUtcEpochSeconds(now);
 }

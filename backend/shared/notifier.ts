@@ -154,3 +154,184 @@ export class AlertNotifier {
 export function createAlertNotifier(config: NotifierConfig): AlertNotifier {
   return new AlertNotifier(config);
 }
+
+/**
+ * Minimum oracle relayer wallet XLM reserve before a low-balance alert fires.
+ * Below this the relayer may not be able to pay gas for automated submissions.
+ */
+export const ORACLE_MIN_XLM_RESERVE = 100;
+
+/**
+ * Minimum escrowed challenge bond capacity (in XLM) before a depletion alert
+ * fires. When the escrow can no longer cover new challenge bonds, disputes
+ * cannot be opened and resolutions stall.
+ */
+export const ORACLE_MIN_BOND_CAPACITY = 100;
+
+/** Snapshot of the oracle treasury balances used by the monitor. */
+export interface OracleTreasurySnapshot {
+  /** Relayer wallet XLM balance available for gas fees. */
+  walletXlm: number;
+  /** Escrowed challenge bond capacity remaining, in XLM. */
+  bondCapacityXlm: number;
+  /** Optional ISO timestamp of when the snapshot was taken. */
+  timestamp?: string;
+}
+
+/** Result of a single treasury balance evaluation. */
+export interface OracleTreasuryEvaluation {
+  walletLow: boolean;
+  bondDepleted: boolean;
+  /** True when either the wallet or bond capacity is below threshold. */
+  needsReplenishment: boolean;
+  /** XLM required to restore the wallet to the minimum reserve (0 if healthy). */
+  walletTopUpXlm: number;
+  /** XLM required to restore bond capacity to the minimum (0 if healthy). */
+  bondTopUpXlm: number;
+}
+
+/**
+ * Evaluate a treasury snapshot against the configured thresholds. Pure helper
+ * so it can be reused by the periodic monitor and by metrics endpoints.
+ */
+export function evaluateOracleTreasury(
+  snapshot: OracleTreasurySnapshot,
+  thresholds: { minWalletXlm?: number; minBondCapacityXlm?: number } = {},
+): OracleTreasuryEvaluation {
+  const minWallet = thresholds.minWalletXlm ?? ORACLE_MIN_XLM_RESERVE;
+  const minBond = thresholds.minBondCapacityXlm ?? ORACLE_MIN_BOND_CAPACITY;
+
+  const walletLow = snapshot.walletXlm < minWallet;
+  const bondDepleted = snapshot.bondCapacityXlm < minBond;
+
+  return {
+    walletLow,
+    bondDepleted,
+    needsReplenishment: walletLow || bondDepleted,
+    walletTopUpXlm: walletLow ? Math.max(0, minWallet - snapshot.walletXlm) : 0,
+    bondTopUpXlm: bondDepleted ? Math.max(0, minBond - snapshot.bondCapacityXlm) : 0,
+  };
+}
+
+/**
+ * Hook invoked when the treasury needs replenishment. Implementations may
+ * trigger an automated top-up transfer; the monitor awaits the result so
+ * failures can be surfaced to the monitoring channel.
+ */
+export type AutoReplenishHook = (
+  evaluation: OracleTreasuryEvaluation,
+  snapshot: OracleTreasurySnapshot,
+) => Promise<void> | void;
+
+/**
+ * Periodic oracle treasury monitor. Checks the relayer wallet XLM balance and
+ * escrowed challenge bond capacity, dispatches alerts to the monitoring
+ * channel when either drops below threshold, and invokes the auto-replenish
+ * hook so automated top-ups can be triggered.
+ */
+export class OracleTreasuryMonitor {
+  private readonly notifier: AlertNotifier;
+  private readonly getSnapshot: () => Promise<OracleTreasurySnapshot>;
+  private readonly onReplenish?: AutoReplenishHook;
+  private readonly minWalletXlm: number;
+  private readonly minBondCapacityXlm: number;
+  private timer?: ReturnType<typeof setInterval>;
+  private lastEvaluation?: OracleTreasuryEvaluation;
+
+  constructor(options: {
+    notifier: AlertNotifier;
+    getSnapshot: () => Promise<OracleTreasurySnapshot>;
+    onReplenish?: AutoReplenishHook;
+    minWalletXlm?: number;
+    minBondCapacityXlm?: number;
+  }) {
+    this.notifier = options.notifier;
+    this.getSnapshot = options.getSnapshot;
+    this.onReplenish = options.onReplenish;
+    this.minWalletXlm = options.minWalletXlm ?? ORACLE_MIN_XLM_RESERVE;
+    this.minBondCapacityXlm = options.minBondCapacityXlm ?? ORACLE_MIN_BOND_CAPACITY;
+  }
+
+  /** Run a single balance check, alerting and triggering top-ups as needed. */
+  async check(): Promise<OracleTreasuryEvaluation> {
+    const snapshot = await this.getSnapshot();
+    const evaluation = evaluateOracleTreasury(snapshot, {
+      minWalletXlm: this.minWalletXlm,
+      minBondCapacityXlm: this.minBondCapacityXlm,
+    });
+    this.lastEvaluation = evaluation;
+
+    if (evaluation.walletLow) {
+      await this.notifier.notify({
+        title: 'Oracle relayer wallet low on XLM',
+        message: `Relayer wallet holds ${snapshot.walletXlm} XLM, below the ${this.minWalletXlm} XLM reserve. Automated submissions may stall.`,
+        severity: 'critical',
+        channel: 'alerts-critical',
+        fields: {
+          'Wallet XLM': snapshot.walletXlm,
+          'Min reserve': this.minWalletXlm,
+          'Top-up needed': evaluation.walletTopUpXlm,
+        },
+        timestamp: snapshot.timestamp,
+      });
+    }
+
+    if (evaluation.bondDepleted) {
+      await this.notifier.notify({
+        title: 'Oracle challenge bond capacity depleted',
+        message: `Escrowed challenge bond capacity is ${snapshot.bondCapacityXlm} XLM, below the ${this.minBondCapacityXlm} XLM minimum. New disputes cannot be bonded.`,
+        severity: 'high',
+        channel: 'oracle-disputes',
+        fields: {
+          'Bond capacity': snapshot.bondCapacityXlm,
+          'Min capacity': this.minBondCapacityXlm,
+          'Top-up needed': evaluation.bondTopUpXlm,
+        },
+        timestamp: snapshot.timestamp,
+      });
+    }
+
+    if (evaluation.needsReplenishment && this.onReplenish) {
+      try {
+        await this.onReplenish(evaluation, snapshot);
+      } catch (err) {
+        await this.notifier.notify({
+          title: 'Oracle auto-replenishment failed',
+          message: `Auto-replenishment hook threw: ${err instanceof Error ? err.message : String(err)}`,
+          severity: 'critical',
+          channel: 'alerts-critical',
+          timestamp: snapshot.timestamp,
+        });
+      }
+    }
+
+    return evaluation;
+  }
+
+  /** Start periodic balance checks. No-op if already running. */
+  start(intervalMs = 60_000): void {
+    if (this.timer) {
+      return;
+    }
+    this.timer = setInterval(() => {
+      void this.check().catch(() => undefined);
+    }, intervalMs);
+    // Do not keep the process alive solely for the monitor.
+    if (typeof this.timer === 'object' && this.timer && 'unref' in this.timer) {
+      (this.timer as { unref: () => void }).unref();
+    }
+  }
+
+  /** Stop periodic balance checks. */
+  stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+    }
+  }
+
+  /** Latest evaluation, exposed for the metrics endpoint. */
+  getLastEvaluation(): OracleTreasuryEvaluation | undefined {
+    return this.lastEvaluation;
+  }
+}
