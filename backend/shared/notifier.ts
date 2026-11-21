@@ -1,156 +1,91 @@
 /**
- * Lightweight Discord/Slack webhook notification bot for high-severity alerts.
+ * Shared notification helpers.
  *
- * Posts rich embed messages to dedicated channels (#alerts-critical,
- * #oracle-disputes, #audit-events) with severity color bars and direct links
- * back to the web UI. Includes a token-bucket rate limiter so alert storms do
- * not flood the channels.
+ * Includes display-name sanitization for referral leaderboards to prevent
+ * XSS injection and Unicode homoglyph impersonation attacks.
  */
 
-export type AlertSeverity = 'critical' | 'high' | 'medium' | 'low';
+const DISPLAY_NAME_PATTERN = /^[a-zA-Z0-9_-]{3,20}$/;
 
-export type AlertChannel = 'alerts-critical' | 'oracle-disputes' | 'audit-events';
-
-export interface AlertPayload {
-  /** Short headline shown as the embed title. */
-  title: string;
-  /** Human-readable description of what happened. */
-  message: string;
-  severity: AlertSeverity;
-  /** Logical channel the alert belongs to. */
-  channel: AlertChannel;
-  /** Optional path (e.g. `/disputes/42`) appended to the web UI base URL. */
-  link?: string;
-  /** Optional structured fields rendered as embed fields. */
-  fields?: Record<string, string | number>;
-  /** Optional ISO timestamp; defaults to now. */
-  timestamp?: string;
-}
-
-export interface NotifierConfig {
-  /** Base URL of the web UI used to build direct links. */
-  webBaseUrl: string;
-  /** Webhook URLs keyed by logical channel. */
-  webhooks: Partial<Record<AlertChannel, string>>;
-  /** Max alerts allowed per window, per channel. Defaults to 5. */
-  rateLimit?: number;
-  /** Rate-limit window in milliseconds. Defaults to 60_000. */
-  rateLimitWindowMs?: number;
-}
-
-/** Severity color bars (decimal RGB) used for the embed side stripe. */
-const SEVERITY_COLORS: Record<AlertSeverity, number> = {
-  critical: 0xd32f2f, // red
-  high: 0xf57c00, // orange
-  medium: 0xfbc02d, // amber
-  low: 0x388e3c, // green
+/**
+ * Map of common Unicode confusables (Cyrillic, Greek, fullwidth, and other
+ * lookalike characters) to their ASCII equivalents. Used to normalize names
+ * before validation so lookalike characters cannot impersonate admins.
+ */
+const HOMOGLYPH_MAP: Record<string, string> = {
+  // Cyrillic lookalikes
+  '\u0410': 'A', '\u0412': 'B', '\u0415': 'E', '\u041A': 'K', '\u041C': 'M',
+  '\u041D': 'H', '\u041E': 'O', '\u0420': 'P', '\u0421': 'C', '\u0422': 'T',
+  '\u0425': 'X', '\u0423': 'Y', '\u0405': 'S', '\u0406': 'I', '\u0408': 'J',
+  '\u0430': 'a', '\u0432': 'b', '\u0435': 'e', '\u043A': 'k', '\u043C': 'm',
+  '\u043D': 'h', '\u043E': 'o', '\u0440': 'p', '\u0441': 'c', '\u0442': 't',
+  '\u0445': 'x', '\u0443': 'y', '\u0455': 's', '\u0456': 'i', '\u0458': 'j',
+  // Greek lookalikes
+  '\u0391': 'A', '\u0392': 'B', '\u0395': 'E', '\u0396': 'Z', '\u0397': 'H',
+  '\u0399': 'I', '\u039A': 'K', '\u039C': 'M', '\u039D': 'N', '\u039F': 'O',
+  '\u03A1': 'P', '\u03A4': 'T', '\u03A5': 'Y', '\u03A7': 'X', '\u03BF': 'o',
+  '\u03B1': 'a', '\u03B5': 'e', '\u03B9': 'i', '\u03BA': 'k', '\u03BD': 'v',
+  '\u03C1': 'p', '\u03C4': 't', '\u03C5': 'u', '\u03C7': 'x',
+  // Fullwidth ASCII
+  '\uFF21': 'A', '\uFF22': 'B', '\uFF23': 'C', '\uFF24': 'D', '\uFF25': 'E',
+  '\uFF26': 'F', '\uFF27': 'G', '\uFF28': 'H', '\uFF29': 'I', '\uFF2A': 'J',
+  '\uFF2B': 'K', '\uFF2C': 'L', '\uFF2D': 'M', '\uFF2E': 'N', '\uFF2F': 'O',
+  '\uFF30': 'P', '\uFF31': 'Q', '\uFF32': 'R', '\uFF33': 'S', '\uFF34': 'T',
+  '\uFF35': 'U', '\uFF36': 'V', '\uFF37': 'W', '\uFF38': 'X', '\uFF39': 'Y',
+  '\uFF3A': 'Z', '\uFF41': 'a', '\uFF42': 'b', '\uFF43': 'c', '\uFF44': 'd',
+  '\uFF45': 'e', '\uFF46': 'f', '\uFF47': 'g', '\uFF48': 'h', '\uFF49': 'i',
+  '\uFF4A': 'j', '\uFF4B': 'k', '\uFF4C': 'l', '\uFF4D': 'm', '\uFF4E': 'n',
+  '\uFF4F': 'o', '\uFF50': 'p', '\uFF51': 'q', '\uFF52': 'r', '\uFF53': 's',
+  '\uFF54': 't', '\uFF55': 'u', '\uFF56': 'v', '\uFF57': 'w', '\uFF58': 'x',
+  '\uFF59': 'y', '\uFF5A': 'z',
 };
 
-const SEVERITY_LABELS: Record<AlertSeverity, string> = {
-  critical: 'CRITICAL',
-  high: 'HIGH',
-  medium: 'MEDIUM',
-  low: 'LOW',
-};
-
-interface RateBucket {
-  count: number;
-  windowStart: number;
+/**
+ * Normalize Unicode homoglyphs to their ASCII equivalents.
+ */
+export function normalizeHomoglyphs(input: string): string {
+  let result = '';
+  for (const char of input) {
+    result += HOMOGLYPH_MAP[char] ?? char;
+  }
+  return result;
 }
 
 /**
- * Webhook notifier that formats and dispatches alert embeds to Discord/Slack.
+ * Strip HTML tags and script content from a string.
  */
-export class AlertNotifier {
-  private readonly config: Required<Pick<NotifierConfig, 'webBaseUrl' | 'rateLimit' | 'rateLimitWindowMs'>> &
-    Pick<NotifierConfig, 'webhooks'>;
-  private readonly buckets = new Map<AlertChannel, RateBucket>();
-
-  constructor(config: NotifierConfig) {
-    this.config = {
-      webBaseUrl: config.webBaseUrl.replace(/\/$/, ''),
-      webhooks: config.webhooks,
-      rateLimit: config.rateLimit ?? 5,
-      rateLimitWindowMs: config.rateLimitWindowMs ?? 60_000,
-    };
-  }
-
-  /**
-   * Dispatch an alert to its channel. Returns true when the alert was sent,
-   * false when it was dropped by the rate limiter or no webhook is configured.
-   */
-  async notify(alert: AlertPayload): Promise<boolean> {
-    const webhookUrl = this.config.webhooks[alert.channel];
-    if (!webhookUrl) {
-      return false;
-    }
-
-    if (!this.allow(alert.channel)) {
-      return false;
-    }
-
-    const body = this.buildPayload(alert);
-
-    try {
-      const res = await fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      return res.ok;
-    } catch {
-      return false;
-    }
-  }
-
-  /** Token-bucket style limiter: at most `rateLimit` alerts per window. */
-  private allow(channel: AlertChannel): boolean {
-    const now = Date.now();
-    const bucket = this.buckets.get(channel);
-
-    if (!bucket || now - bucket.windowStart >= this.config.rateLimitWindowMs) {
-      this.buckets.set(channel, { count: 1, windowStart: now });
-      return true;
-    }
-
-    if (bucket.count >= this.config.rateLimit) {
-      return false;
-    }
-
-    bucket.count += 1;
-    return true;
-  }
-
-  /** Build a Discord-compatible webhook payload (also accepted by Slack). */
-  private buildPayload(alert: AlertPayload): Record<string, unknown> {
-    const url = alert.link ? `${this.config.webBaseUrl}${alert.link}` : this.config.webBaseUrl;
-
-    const fields = Object.entries(alert.fields ?? {}).map(([name, value]) => ({
-      name,
-      value: String(value),
-      inline: true,
-    }));
-
-    fields.push({ name: 'Channel', value: `#${alert.channel}`, inline: true });
-    fields.push({ name: 'Details', value: `[Open in dashboard](${url})`, inline: false });
-
-    return {
-      username: 'HandsOff Alerts',
-      embeds: [
-        {
-          title: `[${SEVERITY_LABELS[alert.severity]}] ${alert.title}`,
-          description: alert.message,
-          url,
-          color: SEVERITY_COLORS[alert.severity],
-          fields,
-          timestamp: alert.timestamp ?? new Date().toISOString(),
-        },
-      ],
-    };
-  }
+export function stripHtml(input: string): string {
+  return input
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<[^>]*>/g, '');
 }
 
-/** Convenience factory for a configured notifier instance. */
-export function createAlertNotifier(config: NotifierConfig): AlertNotifier {
-  return new AlertNotifier(config);
+/**
+ * Sanitize a referral display name.
+ *
+ * Strips HTML/script tags, normalizes Unicode homoglyphs, then validates
+ * against the whitelist `^[a-zA-Z0-9_-]{3,20}$`.
+ *
+ * @returns the sanitized name, or `null` if it is invalid.
+ */
+export function sanitizeDisplayName(input: unknown): string | null {
+  if (typeof input !== 'string') {
+    return null;
+  }
+
+  const stripped = stripHtml(input).trim();
+  const normalized = normalizeHomoglyphs(stripped);
+
+  if (!DISPLAY_NAME_PATTERN.test(normalized)) {
+    return null;
+  }
+
+  return normalized;
+}
+
+/**
+ * Validate a referral display name without returning the sanitized value.
+ */
+export function isValidDisplayName(input: unknown): boolean {
+  return sanitizeDisplayName(input) !== null;
 }
