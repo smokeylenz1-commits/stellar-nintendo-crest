@@ -21,6 +21,30 @@ pub struct Market {
     pub escrowed_bonds: i128,
 }
 
+/// Immutable market metadata, written once at creation and never mutated.
+///
+/// Kept in a separate storage entry from the dynamic pool totals so that
+/// `place_bet` does not pay to read/write the static description bytes.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketStatic {
+    pub id: u64,
+    pub creator: Address,
+    pub token: Address,
+}
+
+/// Dynamic market pool totals, loaded and mutated on every `place_bet`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MarketPool {
+    pub total_yes: i128,
+    pub total_no: i128,
+    pub claimed: i128,
+    pub resolved: bool,
+    pub outcome: bool,
+    pub escrowed_bonds: i128,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Position {
@@ -224,72 +248,4 @@ impl PredictionMarket {
         env.storage().persistent().set(&Self::market_key(&env, market_id), &market);
         env.storage()
             .persistent()
-            .set(&Self::position_key(&env, market_id, &bettor), &position);
-    }
-
-    pub fn resolve_market(env: Env, admin: Address, market_id: u64, outcome: bool) {
-        Self::require_admin(&env, &admin);
-        let mut market: Market = env
-            .storage()
-            .persistent()
-            .get(&Self::market_key(&env, market_id))
-            .expect("market not found");
-        assert!(!market.resolved, "already resolved");
-        market.resolved = true;
-        market.outcome = outcome;
-        env.storage().persistent().set(&Self::market_key(&env, market_id), &market);
-    }
-
-    pub fn claim(env: Env, claimant: Address, market_id: u64) {
-        claimant.require_auth();
-        let mut market: Market = env
-            .storage()
-            .persistent()
-            .get(&Self::market_key(&env, market_id))
-            .expect("market not found");
-        assert!(market.resolved, "market not resolved");
-
-        let mut position: Position = env
-            .storage()
-            .persistent()
-            .get(&Self::position_key(&env, market_id, &claimant))
-            .expect("no position");
-        assert!(!position.claimed, "already claimed");
-
-        let winning = if market.outcome { position.yes } else { position.no };
-        let losing = if market.outcome { position.no } else { position.yes };
-        let total_winning = if market.outcome { market.total_yes } else { market.total_no };
-        let total_losing = if market.outcome { market.total_no } else { market.total_yes };
-
-        let mut payout = winning;
-        if total_winning > 0 && total_losing > 0 {
-            payout += (winning * total_losing) / total_winning;
-        }
-
-        let config: Config = env.storage().instance().get(&Symbol::new(&env, "config")).unwrap();
-        let fee = (payout * config.fee_bps as i128) / 10_000;
-        let net = payout - fee;
-
-        position.claimed = true;
-        market.claimed += payout;
-
-        let mut updated_config = config;
-        updated_config.accumulated_fees += fee;
-
-        env.storage().persistent().set(&Self::market_key(&env, market_id), &market);
-        env.storage()
-            .persistent()
-            .set(&Self::position_key(&env, market_id, &claimant), &position);
-        env.storage().instance().set(&Symbol::new(&env, "config"), &updated_config);
-
-        let token_client = token::Client::new(&env, &market.token);
-        token_client.transfer(&env.current_contract_address(), &claimant, &net);
-    }
-
-    pub fn escrow_bond(env: Env, from: Address, market_id: u64, amount: i128) {
-        from.require_auth();
-        assert!(amount > 0, "amount must be positive");
-        let mut market: Market = env
-            
-
-/* … truncated 2125 chars — edit only what you need near the top … */
+            .set(&Self::positio
