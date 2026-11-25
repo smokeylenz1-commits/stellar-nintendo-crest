@@ -34,6 +34,9 @@ pub enum TokenError {
     UnauthorizedCaller  = 7,
 }
 
+/// Default timelock delay: 48 hours, expressed in seconds.
+pub const DEFAULT_UPGRADE_DELAY: u64 = 48 * 60 * 60;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -85,13 +88,126 @@ impl IPredictTokenContract {
         Ok(())
     }
 
-    /// Replace this contract's WASM in place. Admin only. Balances preserved.
-    pub fn upgrade(env: Env, admin: Address, new_wasm_hash: BytesN<32>) -> Result<(), TokenError> {
-        let stored: Address = env.storage().instance().get(&DataKey::Admin)
-            .ok_or(TokenError::NotInitialized)?;
-        if admin != stored { return Err(TokenError::NotAdmin); }
+    /// Configure the multi-sig upgrade authority. Admin only. `admins` is the set of
+    /// addresses that must approve upgrades; `threshold` is how many approvals are
+    /// required. `delay` is the timelock in seconds (defaults to 48h if 0).
+    pub fn set_upgrade_admins(
+        env: Env,
+        admins: Vec<Address>,
+        threshold: u32,
+        delay: u64,
+    ) -> Result<(), TokenError> {
+        let admin: Address = Self::require_admin(&env)?;
         admin.require_auth();
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        if threshold == 0 || threshold as u32 > admins.len() {
+            return Err(TokenError::InvalidAmount);
+        }
+        let effective_delay = if delay == 0 { DEFAULT_UPGRADE_DELAY } else { delay };
+        env.storage().instance().set(&DataKey::UpgradeAdmins, &admins);
+        env.storage().instance().set(&DataKey::UpgradeThreshold, &threshold);
+        env.storage().instance().set(&DataKey::UpgradeDelay, &effective_delay);
+        Ok(())
+    }
+
+    /// Schedule a WASM upgrade. Requires multi-sig approval to schedule; the upgrade
+    /// cannot be executed until the timelock delay has elapsed.
+    pub fn schedule_upgrade(
+        env: Env,
+        approver: Address,
+        new_wasm_hash: BytesN<32>,
+    ) -> Result<(), TokenError> {
+        Self::require_upgrade_admin(&env, &approver)?;
+        approver.require_auth();
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeApprovals)
+            .unwrap_or_else(|| Vec::new(&env));
+        if approvals.contains(&approver) {
+            return Err(TokenError::AlreadyApproved);
+        }
+        approvals.push_back(approver.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeThreshold)
+            .unwrap_or(1);
+        if approvals.len() < threshold {
+            env.storage().instance().set(&DataKey::UpgradeApprovals, &approvals);
+            return Ok(());
+        }
+
+        let now = env.ledger().timestamp();
+        env.storage().instance().set(&DataKey::PendingWasmHash, &new_wasm_hash);
+        env.storage().instance().set(&DataKey::UpgradeScheduledAt, &now);
+        env.storage().instance().set(&DataKey::UpgradeApprovals, &Vec::<Address>::new(&env));
+
+        env.events().publish(
+            (String::from_str(&env, "token"), String::from_str(&env, "UpgradeScheduled")),
+            (new_wasm_hash, now),
+        );
+        Ok(())
+    }
+
+    /// Execute a previously scheduled upgrade. Requires multi-sig approval and that
+    /// the timelock delay has elapsed since scheduling.
+    pub fn execute_upgrade(env: Env, approver: Address) -> Result<(), TokenError> {
+        Self::require_upgrade_admin(&env, &approver)?;
+        approver.require_auth();
+
+        let new_wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingWasmHash)
+            .ok_or(TokenError::UpgradeNotScheduled)?;
+        let scheduled_at: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeScheduledAt)
+            .ok_or(TokenError::UpgradeNotScheduled)?;
+
+        let delay: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeDelay)
+            .unwrap_or(DEFAULT_UPGRADE_DELAY);
+        let now = env.ledger().timestamp();
+        if now < scheduled_at.saturating_add(delay) {
+            return Err(TokenError::TimelockNotElapsed);
+        }
+
+        let mut approvals: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeApprovals)
+            .unwrap_or_else(|| Vec::new(&env));
+        if approvals.contains(&approver) {
+            return Err(TokenError::AlreadyApproved);
+        }
+        approvals.push_back(approver.clone());
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeThreshold)
+            .unwrap_or(1);
+        if approvals.len() < threshold {
+            env.storage().instance().set(&DataKey::UpgradeApprovals, &approvals);
+            return Ok(());
+        }
+
+        env.storage().instance().remove(&DataKey::PendingWasmHash);
+        env.storage().instance().remove(&DataKey::UpgradeScheduledAt);
+        env.storage().instance().remove(&DataKey::UpgradeApprovals);
+
+        env.deployer().update_current_contract_wasm(new_wasm_hash.clone());
+
+        env.events().publish(
+            (String::from_str(&env, "token"), String::from_str(&env, "UpgradeExecuted")),
+            (new_wasm_hash, now),
+        );
         Ok(())
     }
 
